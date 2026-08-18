@@ -1,0 +1,361 @@
+/* =========================
+   App Container
+   ========================= */
+
+   .app-header {
+  text-align: center;
+  margin-bottom: 40px;
+}
+
+.app-header h1 {
+  margin: 0;
+  color: var(--text-h);
+  font-size: 48px;
+  line-height: 1.1;
+}
+
+.app-header p {
+  margin: 14px 0 0;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.app-container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 48px 24px;
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+
+
+/* =========================
+   Input Section
+   ========================= */
+
+.input-section {
+  margin-bottom: 12px;
+}
+
+textarea {
+  width: 100%;
+  max-width: 100%;
+  min-height: 120px;
+  padding: 10px;
+  
+
+  border: 1px solid var(--border);
+  border-radius: 10px;
+
+  background: var(--bg-secondary);
+  color: var(--text-h);
+
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.7;
+
+  resize: none;
+  display: block;
+
+  
+}
+
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(97, 205, 235, 0.12);
+}
+
+textarea::placeholder {
+  color: var(--text);
+  opacity: 0.7;
+}
+
+
+/* =========================
+   Button
+   ========================= */
+
+button {
+  margin-top: 18px;
+
+  padding: 13px 28px;
+
+  border: none;
+  border-radius: 8px;
+
+  background: var(--accent);
+  color: #0f172a;
+
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 700;
+
+  cursor: pointer;
+
+  transition:
+    transform 0.15s ease,
+    opacity 0.15s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+
+/* =========================
+   Results
+   ========================= */
+
+.results-section {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+
+/* =========================
+   Cards
+   ========================= */
+
+.card {
+  background: var(--bg-secondary);
+
+  border: 1px solid var(--border);
+  border-radius: 10px;
+
+  padding: 24px;
+  box-sizing: border-box;
+}
+
+.card h2 {
+  margin: 0 0 18px;
+
+  padding-bottom: 14px;
+
+  border-bottom: 1px solid var(--border);
+
+  color: var(--text-h);
+
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.card-content {
+  color: var(--text);
+  line-height: 1.7;
+}
+
+
+/* =========================
+   Summary
+   ========================= */
+
+.summary-card {
+  background: var(--bg-secondary);
+}
+
+.summary-text {
+  margin: 0;
+
+  color: var(--text-h);
+
+  font-size: 16px;
+  line-height: 1.8;
+}
+
+
+/* =========================
+   Lists
+   ========================= */
+
+ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+
+/* =========================
+   Decisions
+   ========================= */
+
+.decision-item {
+  padding: 15px 18px;
+  margin-bottom: 10px;
+
+  background: var(--bg-tertiary);
+
+  border: 1px solid var(--border);
+  border-radius: 8px;
+
+  color: var(--text);
+
+  line-height: 1.6;
+}
+
+.decision-item:last-child {
+  margin-bottom: 0;
+}
+
+
+/* =========================
+   Action Items
+   ========================= */
+
+.action-item {
+  display: grid;
+
+  grid-template-columns: 130px minmax(0, 1fr) 130px;
+
+  gap: 20px;
+  align-items: center;
+
+  padding: 16px 18px;
+  margin-bottom: 10px;
+
+  background: var(--bg-tertiary);
+
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.action-item:last-child {
+  margin-bottom: 0;
+}
+
+.action-owner {
+  color: var(--accent);
+
+  font-size: 12px;
+  font-weight: 700;
+
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.action-task {
+  color: var(--text-h);
+
+  font-size: 15px;
+  font-weight: 500;
+
+  line-height: 1.5;
+}
+
+.action-deadline {
+  color: var(--text);
+
+  font-size: 14px;
+  font-weight: 500;
+
+  text-align: right;
+}
+
+
+/* =========================
+   Spacer
+   ========================= */
+
+#spacer {
+  height: 64px;
+
+  border-top: 1px solid var(--border);
+}
+
+
+/* =========================
+   Decorative Ticks
+   ========================= */
+
+.ticks {
+  position: relative;
+  width: 100%;
+}
+
+.ticks::before,
+.ticks::after {
+  content: "";
+
+  position: absolute;
+  top: -4px;
+
+  width: 0;
+  height: 0;
+
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+
+.ticks::before {
+  left: 0;
+  border-left: 5px solid var(--border);
+}
+
+.ticks::after {
+  right: 0;
+  border-right: 5px solid var(--border);
+}
+
+
+/* =========================
+   Responsive
+   ========================= */
+
+@media (max-width: 768px) {
+  .app-container {
+    padding: 32px 16px;
+  }
+
+  .input-section {
+    margin-bottom: 36px;
+  }
+
+  textarea {
+    min-height: 240px;
+    padding: 16px;
+  }
+
+  button {
+    width: 100%;
+  }
+
+  .action-item {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .action-deadline {
+    text-align: left;
+  }
+}
+
+@media (max-width: 480px) {
+  .app-container {
+    padding: 24px 12px;
+  }
+
+  .card {
+    padding: 18px;
+  }
+
+  .card h2 {
+    font-size: 18px;
+  }
+}
