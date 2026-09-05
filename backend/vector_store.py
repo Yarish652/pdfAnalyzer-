@@ -20,14 +20,15 @@ def add_documents(chunks, embeddings):
             "page": 1,
             "section": "...",
             "subsection": "...",
-            "chunk_index": 0
+            "chunk_index": 0,
+            "document_id": "..."
         }
     }
     """
 
     collection.add(
         ids=[
-            str(chunk["metadata"]["chunk_index"])
+            f"{chunk['metadata']['document_id']}:{chunk['metadata']['chunk_index']}"
             for chunk in chunks
         ],
         documents=[
@@ -42,9 +43,9 @@ def add_documents(chunks, embeddings):
     )
 
 
-def search(query_embedding, top_k=3):
+def search(query_embedding, document_id, top_k=3):
     """
-    Search Chroma using the query embedding.
+    Search one document in Chroma using the query embedding.
 
     Chroma returns both the retrieved documents and their
     associated metadata.
@@ -53,6 +54,7 @@ def search(query_embedding, top_k=3):
     results = collection.query(
         query_embeddings=query_embedding.tolist(),
         n_results=top_k,
+        where={"document_id": document_id},
     )
 
     return results

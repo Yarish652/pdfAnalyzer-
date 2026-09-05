@@ -9,13 +9,15 @@ type ConversationMessage = {
 };
 
 type AskResponse = { question: string; rewritten_query: string; answer: string; sources: string[] };
-type UploadResponse = { success: boolean; filename: string };
+type UploadResponse = { success: boolean; filename: string; document_id: string; status: string };
+type UploadStatusResponse = { document_id: string; status: "pending" | "processing" | "ready" | "failed" };
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
 function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [documentName, setDocumentName] = useState<string | null>(null);
+  const [documentId, setDocumentId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [uploadError, setUploadError] = useState("");
@@ -57,7 +59,19 @@ function App() {
       if (!response.ok) throw new Error("upload failed");
       const data: UploadResponse = await response.json();
       if (!data.success) throw new Error("upload failed");
+
+      let status = data.status;
+      while (status === "pending" || status === "processing") {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const statusResponse = await fetch(`${API_BASE_URL}/upload/${data.document_id}/status`);
+        if (!statusResponse.ok) throw new Error("upload failed");
+        const statusData: UploadStatusResponse = await statusResponse.json();
+        status = statusData.status;
+      }
+      if (status !== "ready") throw new Error("upload failed");
+
       setDocumentName(data.filename || selectedFile.name);
+      setDocumentId(data.document_id);
       setMessages([]);
       setQuestion("");
       setChatError("");
@@ -71,7 +85,7 @@ function App() {
   async function handleAsk(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const trimmedQuestion = question.trim();
-    if (!documentName || !trimmedQuestion || isAsking) return;
+    if (!documentName || !documentId || !trimmedQuestion || isAsking) return;
 
     const userMessage: ConversationMessage = { id: crypto.randomUUID(), role: "user", content: trimmedQuestion };
     const history = messages.map(({ role, content }) => ({ role, content }));
@@ -84,7 +98,7 @@ function App() {
       const response = await fetch(`${API_BASE_URL}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: trimmedQuestion, history }),
+        body: JSON.stringify({ question: trimmedQuestion, document_id: documentId, history }),
       });
       if (!response.ok) throw new Error(response.status === 502 ? "generation unavailable" : "ask failed");
       const data: AskResponse = await response.json();
