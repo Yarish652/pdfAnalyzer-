@@ -1,6 +1,24 @@
 # PDF Assistant
 
-A local V1 RAG application: upload a PDF, then ask questions grounded in its contents.
+A local V2 retrieval-augmented generation (RAG) application. Upload a PDF and
+ask questions grounded in its contents. Retrieval combines MPNet semantic
+search with BM25 keyword search, reciprocal rank fusion, and local
+cross-encoder reranking.
+
+## Retrieval pipeline
+
+For each question, the backend:
+
+1. Rewrites the query when conversation history requires it.
+2. Retrieves the top 10 chunks with MPNet vector search.
+3. Retrieves the top 10 chunks with BM25 keyword search.
+4. Fuses both rankings with reciprocal rank fusion.
+5. Reranks the fused candidates with a local cross-encoder and uses the top 3
+	chunks for answer generation.
+
+The vector store is persisted locally under `backend/chroma_db/`. It is runtime
+data and is intentionally excluded from Git. Upload a document locally before
+using the chat application.
 
 ## Backend setup
 
@@ -26,7 +44,7 @@ MAX_PDF_PAGES=300
 `MAX_UPLOAD_SIZE_BYTES` controls the maximum uploaded PDF size. `MAX_PDF_PAGES`
 controls the maximum number of pages accepted during PDF preflight.
 
-Start the API from the backend directory:
+Start the API from the repository root:
 
 ```bash
 cd backend
@@ -44,6 +62,23 @@ npm run dev
 ```
 
 The Vite development server proxies `/upload` and `/ask` to the backend at `http://127.0.0.1:8000`.
+
+## Retrieval evaluation
+
+The local evaluation suite compares the previous MPNet-only pipeline (V1)
+with the V2 hybrid and reranked pipeline. It uses the stored resume benchmark
+questions and reports Recall@3, Recall@10, MRR, NDCG@3, NDCG@10, and
+Precision@3. It does not call the answer generator.
+
+Run it from the repository root after the benchmark document has been ingested:
+
+```bash
+python -m backend.tests.evaluation_suite
+```
+
+The evaluation implementation is in
+`backend/tests/evaluation_suite.py`, and the gold chunk identities are in
+`backend/tests/evaluation_dataset.py`.
 
 ## Workflow
 
