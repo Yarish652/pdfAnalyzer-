@@ -1,7 +1,7 @@
 from openai import APIConnectionError, OpenAI, RateLimitError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
+from backend.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
 
 client = OpenAI(
     base_url=OPENROUTER_BASE_URL,
@@ -85,11 +85,18 @@ def rewrite_query(question, history):
 
 Latest question: {question}
 
-Rewrite the latest question as exactly one standalone natural-language question
-for document retrieval. Resolve pronouns and references from the conversation.
-Preserve the user's intent and important names or project titles. Do not answer
-the question, add facts, use keywords-only phrasing, explain the rewrite, or
-output labels, JSON, history, or multiple queries.
+Rewrite only when necessary.
+
+   If the question is already standalone and retrieval-ready, return it unchanged.
+
+   For conversational questions:
+   - Resolve pronouns and references using the conversation.
+   - Preserve the user's original intent exactly.
+   - Preserve important entities and names.
+   - Do not add unnecessary details from the conversation.
+   - Do not infer information that is not explicitly established.
+   - Do not answer the question.
+   - Return exactly one standalone natural-language question.
 """
 
     response = _create_completion(

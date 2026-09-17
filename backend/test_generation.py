@@ -125,13 +125,13 @@ class GenerationTests(unittest.TestCase):
 
     def test_generation_exception_becomes_bad_gateway(self):
         original_rewrite = api.rewrite_query
-        original_embed = api.embed_texts
-        original_search = api.search
+        original_retrieve = api.retrieve_context_chunks
         original_generate = api.generate_answer
         try:
             api.rewrite_query = lambda question, history: question
-            api.embed_texts = lambda texts: "query-vector"
-            api.search = lambda embedding, document_id, top_k: {"documents": [["context"]]}
+            api.retrieve_context_chunks = lambda query, document_id: [
+                {"text": "context", "metadata": {}}
+            ]
 
             def fail_generation(*_args):
                 raise OpenAIError("OpenRouter unavailable")
@@ -155,8 +155,7 @@ class GenerationTests(unittest.TestCase):
             )
         finally:
             api.rewrite_query = original_rewrite
-            api.embed_texts = original_embed
-            api.search = original_search
+            api.retrieve_context_chunks = original_retrieve
             api.generate_answer = original_generate
 
     def test_rewrite_openrouter_failure_returns_bad_gateway(self):
@@ -186,16 +185,13 @@ class GenerationTests(unittest.TestCase):
 
     def test_search_chroma_failure_returns_bad_gateway_without_details(self):
         original_rewrite = api.rewrite_query
-        original_embed = api.embed_texts
-        original_search = api.search
+        original_retrieve = api.retrieve_context_chunks
         try:
             api.rewrite_query = lambda question, history: question
-            api.embed_texts = lambda texts: "query-vector"
-
-            def fail_search(*_args, **_kwargs):
+            def fail_retrieve(*_args, **_kwargs):
                 raise ChromaError("secret Chroma failure")
 
-            api.search = fail_search
+            api.retrieve_context_chunks = fail_retrieve
             response = asyncio.run(
                 api.ask_question(
                     api.AskRequest(
@@ -213,8 +209,49 @@ class GenerationTests(unittest.TestCase):
             self.assertNotIn("secret Chroma failure", response.body.decode())
         finally:
             api.rewrite_query = original_rewrite
-            api.embed_texts = original_embed
-            api.search = original_search
+            api.retrieve_context_chunks = original_retrieve
+
+    def test_ask_passes_only_top_three_reranked_chunks_to_generation(self):
+        original_rewrite = api.rewrite_query
+        original_retrieve = api.retrieve_context_chunks
+        original_generate = api.generate_answer
+        try:
+            api.rewrite_query = lambda question, history: "rewritten question"
+            api.retrieve_context_chunks = lambda query, document_id: [
+                {"text": "top one", "metadata": {}},
+                {"text": "top two", "metadata": {}},
+                {"text": "top three", "metadata": {}},
+                {"text": "unexpected fourth", "metadata": {}},
+            ][:3]
+            generation_calls = []
+
+            def capture_generation(question, context, history):
+                generation_calls.append((question, context, history))
+                return "answer"
+
+            api.generate_answer = capture_generation
+
+            response = asyncio.run(
+                api.ask_question(
+                    api.AskRequest(
+                        question="original question",
+                        document_id="document-a",
+                        history=[],
+                    )
+                )
+            )
+
+            body = response
+            self.assertEqual(body["rewritten_query"], "rewritten question")
+            self.assertEqual(body["sources"], ["top one", "top two", "top three"])
+            self.assertEqual(
+                generation_calls,
+                [("original question", "top one\n\ntop two\n\ntop three", [])],
+            )
+        finally:
+            api.rewrite_query = original_rewrite
+            api.retrieve_context_chunks = original_retrieve
+            api.generate_answer = original_generate
 
     def test_malformed_pdf_returns_bad_request_without_details(self):
         response = asyncio.run(
@@ -387,14 +424,14 @@ class DocumentIsolationTests(unittest.TestCase):
 class EventLoopConcurrencyTests(unittest.TestCase):
     def test_concurrent_asks_do_not_block_each_other(self):
         original_rewrite = api.rewrite_query
-        original_embed = api.embed_texts
-        original_search = api.search
+        original_retrieve = api.retrieve_context_chunks
         original_generate = api.generate_answer
 
         try:
             api.rewrite_query = lambda question, history: question
-            api.embed_texts = lambda _texts: _Embeddings()
-            api.search = lambda embedding, document_id, top_k: {"documents": [["context"]]}
+            api.retrieve_context_chunks = lambda query, document_id: [
+                {"text": "context", "metadata": {}}
+            ]
 
             def slow_generation(*_args):
                 time.sleep(0.2)
@@ -421,9 +458,74 @@ class EventLoopConcurrencyTests(unittest.TestCase):
             self.assertEqual([result["answer"] for result in results], ["answer", "answer"])
         finally:
             api.rewrite_query = original_rewrite
+            api.retrieve_context_chunks = original_retrieve
+            api.generate_answer = original_generate
+
+
+class HybridRetrievalTests(unittest.TestCase):
+    def test_retrieval_pipeline_uses_top_ten_and_returns_top_three(self):
+        original_embed = api.embed_texts
+        original_search = api.search
+        original_keyword = api.retrieve_keyword_chunks
+        original_fusion = api.reciprocal_rank_fusion
+        original_rerank = api.rerank_chunks
+        calls = []
+
+        try:
+            api.embed_texts = lambda texts: calls.append(("embed", texts)) or _Embeddings()
+
+            def vector_search(embedding, document_id, top_k):
+                calls.append(("vector", document_id, top_k))
+                return {
+                    "documents": [["vector chunk"]],
+                    "metadatas": [[{
+                        "document_id": document_id,
+                        "chunk_index": 0,
+                    }]],
+                }
+
+            api.search = vector_search
+
+            def keyword_search(query, document_id, top_k):
+                calls.append(("keyword", query, document_id, top_k))
+                return [{
+                    "text": "keyword chunk",
+                    "metadata": {
+                        "document_id": document_id,
+                        "chunk_index": 1,
+                    },
+                }]
+
+            api.retrieve_keyword_chunks = keyword_search
+
+            def fuse(ranked_lists):
+                calls.append(("fuse", ranked_lists))
+                return ranked_lists[0] + ranked_lists[1]
+
+            api.reciprocal_rank_fusion = fuse
+
+            def rerank(query, chunks):
+                calls.append(("rerank", query, chunks))
+                return chunks + [
+                    {"text": "third chunk", "metadata": {}},
+                    {"text": "fourth chunk", "metadata": {}},
+                ]
+
+            api.rerank_chunks = rerank
+
+            result = api.retrieve_context_chunks("rewritten", "document-a")
+
+            self.assertEqual(len(result), 3)
+            self.assertEqual(calls[0], ("embed", ["rewritten"]))
+            self.assertIn(("vector", "document-a", 10), calls)
+            self.assertIn(("keyword", "rewritten", "document-a", 10), calls)
+            self.assertEqual(calls[-1][0], "rerank")
+        finally:
             api.embed_texts = original_embed
             api.search = original_search
-            api.generate_answer = original_generate
+            api.retrieve_keyword_chunks = original_keyword
+            api.reciprocal_rank_fusion = original_fusion
+            api.rerank_chunks = original_rerank
 
 
 if __name__ == "__main__":

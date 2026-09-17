@@ -15,6 +15,9 @@ from config import MAX_PDF_PAGES, MAX_UPLOAD_SIZE_BYTES
 from pdf_reader import extract_document
 from chunker import chunk_document
 from embedding import embed_texts
+from hybrid_retriever import reciprocal_rank_fusion
+from keyword_retriever import retrieve_keyword_chunks
+from reranker import rerank_chunks
 from vector_store import add_documents, search
 from generator import generate_answer, rewrite_query
 
@@ -53,6 +56,34 @@ class UploadTooLargeError(Exception):
 
 class PageLimitExceededError(Exception):
     pass
+
+
+def retrieve_context_chunks(query: str, document_id: str) -> list[dict]:
+    """Retrieve, fuse, and rerank candidates for one question."""
+    query_embedding = embed_texts([query])
+    vector_results = search(query_embedding, document_id, top_k=10)
+
+    documents = (vector_results.get("documents") or [[]])[0] or []
+    metadatas = (vector_results.get("metadatas") or [[]])[0] or []
+    vector_chunks = []
+
+    for index, text in enumerate(documents):
+        metadata = metadatas[index] if index < len(metadatas) else None
+        vector_chunks.append({
+            "text": text,
+            "metadata": metadata or {
+                "document_id": document_id,
+                "chunk_index": index,
+            },
+        })
+
+    keyword_chunks = retrieve_keyword_chunks(query, document_id, top_k=10)
+    fused_chunks = reciprocal_rank_fusion([vector_chunks, keyword_chunks])
+
+    if not fused_chunks:
+        return []
+
+    return rerank_chunks(query, fused_chunks)[:3]
 
 
 def current_correlation_id() -> str:
@@ -224,30 +255,19 @@ async def ask_question(request: AskRequest):
         return error_response(500, "An unexpected internal error occurred.", correlation_id)
 
     try:
-        query_embedding = await run_in_threadpool(embed_texts, [rewritten_query])
-    except Exception:
-        logger.exception("Query embedding failed request_id=%s", correlation_id)
-        return error_response(500, "An unexpected internal error occurred.", correlation_id)
-
-    try:
-        results = await run_in_threadpool(
-            search,
-            query_embedding,
+        context_chunks = await run_in_threadpool(
+            retrieve_context_chunks,
+            rewritten_query,
             request.document_id,
-            top_k=3,
         )
     except ChromaError:
-        logger.exception("Vector search failed request_id=%s", correlation_id)
+        logger.exception("Retrieval failed request_id=%s", correlation_id)
         return error_response(502, "Unable to retrieve document context.", correlation_id)
     except Exception:
-        logger.exception("Vector search failed request_id=%s", correlation_id)
+        logger.exception("Retrieval failed request_id=%s", correlation_id)
         return error_response(500, "An unexpected internal error occurred.", correlation_id)
 
-    try:
-        context = "\n\n".join(results["documents"][0])
-    except Exception:
-        logger.exception("Search result handling failed request_id=%s", correlation_id)
-        return error_response(500, "An unexpected internal error occurred.", correlation_id)
+    context = "\n\n".join(chunk["text"] for chunk in context_chunks)
 
     try:
         answer = await run_in_threadpool(
@@ -267,5 +287,5 @@ async def ask_question(request: AskRequest):
         "question": request.question,
         "rewritten_query": rewritten_query,
         "answer": answer,
-        "sources": results["documents"][0],
+        "sources": [chunk["text"] for chunk in context_chunks],
     }
