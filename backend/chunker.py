@@ -1,7 +1,44 @@
-from typing import List
+"""Type-aware document chunking.
+
+    PDF -> pdf_reader (pages of text blocks)
+        -> document_classifier (resume / slides / prose)
+        -> type-specific chunker
+        -> normalized chunks -> embeddings -> vector store
+
+Every chunker returns the same normalized chunk format, so the rest of the
+pipeline does not need to know which one ran:
+
+    {
+        "text": "...",
+        "metadata": {
+            "page": 1,
+            "section": "...",
+            "subsection": "...",
+            "chunk_index": 0,
+            "document_type": "prose",
+        }
+    }
+
+Design rules shared by all chunkers:
+
+- Chunks never cross a detected section boundary.
+- Size is a safety limit, not the primary boundary. Oversized units are split
+  at sentence (or bullet) boundaries, never mid-sentence.
+- Chunks carry their heading in the text, so a chunk that continues a section
+  or a resume entry still says what it is about.
+"""
+
 import re
+from collections import Counter
+from typing import List
+
 import nltk
 from nltk.tokenize import sent_tokenize
+
+try:
+    from backend.document_classifier import PROSE, RESUME, SLIDES, block_lines, classify_document, is_resume_section
+except ModuleNotFoundError:
+    from document_classifier import PROSE, RESUME, SLIDES, block_lines, classify_document, is_resume_section
 
 
 def ensure_nltk_resource(resource_path: str, package: str):
@@ -19,38 +56,33 @@ ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab")
 # Chunk configuration
 # ---------------------------------------------------------
 
-# Approximate maximum number of words in a chunk.
-# This is a starting point and can be tuned after testing
-# retrieval quality.
-MAX_CHUNK_WORDS = 80
+# Approximate maximum words per chunk for each document type. MPNet reads at
+# most 384 tokens, so chunks stay comfortably below that.
+MAX_CHUNK_WORDS = {
+    RESUME: 120,
+    SLIDES: 150,
+    PROSE: 150,
+}
 
-# Number of sentences carried from the previous chunk
-# into the next chunk when fallback chunking is required.
+# Sentences carried from one prose chunk into the next within a section.
 OVERLAP_SENTENCES = 1
 
+# A sentence longer than this is split by words so no chunk becomes huge.
+MAX_SENTENCE_WORDS = 200
+
+BULLET_PREFIXES = ("•", "●", "▪", "◦", "-", "–", "*", "")
+BULLET_SPLIT = re.compile("\\s*(?=[\u2022\u25cf\u25aa\u25e6\uf0b7])")
+WORD = re.compile(r"[A-Za-z]{2,}")
+
 
 # ---------------------------------------------------------
-# Normalized chunk format
-# ---------------------------------------------------------
-# Every chunk returned by this module has the same format:
-#
-# {
-#     "text": "...",
-#     "metadata": {
-#         "page": 1,
-#         "section": "...",
-#         "subsection": "...",
-#         "chunk_index": 0
-#     }
-# }
-#
-# The rest of the RAG pipeline does not need to know
-# whether the document was structured or unstructured.
+# Shared utilities
 # ---------------------------------------------------------
 
 def make_chunk(
     text: str,
     page: int,
+    document_type: str,
     section: str | None = None,
     subsection: str | None = None,
     chunk_index: int = 0,
@@ -62,254 +94,10 @@ def make_chunk(
             "section": section or "",
             "subsection": subsection or "",
             "chunk_index": chunk_index,
+            "document_type": document_type,
         },
     }
 
-# ---------------------------------------------------------
-# Heading detection
-# ---------------------------------------------------------
-
-def is_section_heading(block: str) -> bool:
-    """
-    Detect a likely top-level section.
-
-    Uppercase text is one useful signal for documents such
-    as resumes and reports.
-
-    This is only a heuristic. We intentionally keep it
-    conservative because PDF text extraction can remove
-    formatting information such as font size and boldness.
-    """
-
-    block = block.strip()
-
-    if not block:
-        return False
-
-    # Bullets are content
-    if block.startswith(("•", "-", "*")):
-        return False
-
-    # Very long blocks are content
-    if len(block) > 100:
-        return False
-
-    # Sentences are content
-    if block.endswith((".", "!", "?")):
-        return False
-
-    # Uppercase text is a strong section signal
-    return block.isupper()
-
-
-def is_subsection_heading(block: str) -> bool:
-
-
-    """
-    Detect a likely subsection heading.
-
-    We deliberately require stronger structural evidence
-    than simply checking whether a block is short.
-
-    Numbered headings and explicit structural prefixes are
-    strong signals. Otherwise, we treat the block as content.
-    """
-
-    block = block.strip()
-
-    if not block:
-        return False
-
-    # Bullets are content, not headings
-    if block.startswith(("•", "-", "*")):
-        return False
-
-    # Long blocks are unlikely to be headings
-    if len(block) > 100:
-        return False
-
-    # Sentences are generally content
-    if block.endswith((".", "!", "?")):
-        return False
-
-    # Uppercase blocks are handled as top-level sections
-    if block.isupper():
-        return False
-
-    # Numbered headings:
-    #
-    # 1 Introduction
-    # 1.1 Background
-    # 2.3.1 Architecture
-    #
-    if re.match(r"^\d+(\.\d+)*[\s:.-]+", block):
-        return True
-
-    # Common structural prefixes.
-    #
-    # These are document-structure signals, not
-    # document-specific keywords.
-    structural_prefixes = (
-        "chapter ",
-        "section ",
-        "appendix ",
-        "part ",
-    )
-
-    if block.lower().startswith(structural_prefixes):
-        return True
-
-    # Without strong evidence, do not guess.
-    return False
-
-def is_content_group_start(blocks: list[str], index: int) -> bool:
-    """
-    Detect whether the current block is likely the beginning
-    of a new semantic content group.
-
-    We use neighboring blocks rather than looking at the
-    current block in isolation.
-
-    Example:
-
-        Project A
-        Technologies
-        • Bullet
-        • Bullet
-        Project B
-        Technologies
-        • Bullet
-
-    "Project B" is a likely new content group because it is
-    followed by a short metadata-like block and then content.
-
-    This is intentionally heuristic. The goal is to detect
-    strong boundaries without making assumptions about a
-    particular document type.
-    """
-
-    block = blocks[index].strip()
-
-    if not block:
-        return False
-
-    # We cannot detect a boundary without a following block.
-    if index + 1 >= len(blocks):
-        return False
-
-    next_block = blocks[index + 1].strip()
-
-    # Bullets themselves belong to the current group.
-    if block.startswith(("•", "-", "*")):
-        return False
-
-    # A sentence is normally content.
-    if block.endswith((".", "!", "?")):
-        return False
-
-    # Long text is normally content.
-    if len(block) > 100:
-        return False
-
-    # If the next block is also a bullet, the current block
-    # is unlikely to be a new semantic group.
-    if next_block.startswith(("•", "-", "*")):
-        return False
-
-    # Numbered structures are strong evidence.
-    if re.match(r"^\d+(\.\d+)*[\s:.-]+", block):
-        return True
-
-    # Explicit structural prefixes are strong evidence.
-    structural_prefixes = (
-        "chapter ",
-        "section ",
-        "appendix ",
-        "part ",
-    )
-
-    if block.lower().startswith(structural_prefixes):
-        return True
-
-    return False
-
-def looks_like_content_boundary(block: str) -> bool:
-    """
-    Detect whether a block may represent the beginning of a
-    new semantic content group.
-
-    This does NOT identify what the block means.
-
-    It only looks for structural signals that suggest the
-    previous group may have ended and a new one is beginning.
-    """
-
-    block = block.strip()
-
-    if not block:
-        return False
-
-    # Bullets are normally part of the current content group.
-    if block.startswith(("•", "-", "*")):
-        return False
-
-    # Long blocks are normally body content.
-    if len(block) > 100:
-        return False
-
-    # Sentences are normally body content.
-    if block.endswith((".", "!", "?")):
-        return False
-
-    # Numbered items are strong boundary signals.
-    if re.match(r"^\d+(\.\d+)*[\s:.-]+", block):
-        return True
-
-    # Explicit structural labels.
-    structural_prefixes = (
-        "chapter ",
-        "section ",
-        "appendix ",
-        "part ",
-    )
-
-    if block.lower().startswith(structural_prefixes):
-        return True
-
-    return False
-
-def looks_like_short_title(block: str) -> bool:
-    """
-    Identify a short title-like block.
-
-    This does not use document-specific keywords.
-    It only looks at the shape of the text.
-    """
-
-    block = block.strip()
-
-    if not block:
-        return False
-
-    if block.startswith(("•", "-", "*")):
-        return False
-
-    if len(block) > 100:
-        return False
-
-    if block.endswith((".", "!", "?")):
-        return False
-
-    words = block.split()
-
-    # Very short blocks can be labels/headings.
-    if 1 <= len(words) <= 12:
-        return True
-
-    return False
-# ---------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------
 
 def word_count(text: str) -> int:
     """Return the approximate number of words in text."""
@@ -317,263 +105,351 @@ def word_count(text: str) -> int:
 
 
 def split_sentences(text: str) -> List[str]:
-    """
-    Split text into sentences.
+    """Split text into sentences, breaking up any runaway sentence by words."""
+    sentences = []
+    for sentence in sent_tokenize(text):
+        words = sentence.split()
+        for start in range(0, len(words), MAX_SENTENCE_WORDS):
+            piece = " ".join(words[start:start + MAX_SENTENCE_WORDS])
+            if piece:
+                sentences.append(piece)
+    return sentences
 
-    NLTK is used here because sentence boundaries are more
-    useful for RAG chunking than blindly cutting text at
-    a fixed character position.
+
+def is_bullet(block: str) -> bool:
+    return block.lstrip().startswith(BULLET_PREFIXES)
+
+
+def noise_ratio(text: str) -> float:
+    """Share of tokens that are not words: figure labels, math symbols."""
+    tokens = text.split()
+    if not tokens:
+        return 1.0
+    return sum(not WORD.search(token) for token in tokens) / len(tokens)
+
+
+def strip_repeated_blocks(document):
+    """Remove running headers, footers, and bare page numbers.
+
+    A block that appears (ignoring digits) on at least a quarter of the pages
+    of a multi-page document is page furniture, not content.
     """
+
+    pages = len(document)
+    if pages < 3:
+        return document
+
+    def signature(block: str) -> str:
+        return re.sub(r"\d+", "#", block.strip().lower())
+
+    def edge_indexes(blocks):
+        # Headers and footers sit at the top or bottom of a page.
+        return set(range(min(2, len(blocks)))) | set(range(max(0, len(blocks) - 2), len(blocks)))
+
+    counts = Counter(
+        page_signature
+        for page in document
+        for page_signature in {
+            signature(page["blocks"][index]) for index in edge_indexes(page["blocks"])
+        }
+    )
+    threshold = max(3, pages // 4)
+
+    def is_furniture(blocks, index):
+        block = blocks[index].strip()
+        return index in edge_indexes(blocks) and (
+            counts[signature(block)] >= threshold
+            or re.fullmatch(r"\d{1,4}", block) is not None
+        )
 
     return [
-        sentence.strip()
-        for sentence in sent_tokenize(text)
-        if sentence.strip()
+        {
+            **page,
+            "blocks": [
+                block
+                for index, block in enumerate(page["blocks"])
+                if not is_furniture(page["blocks"], index)
+            ],
+        }
+        for page in document
     ]
 
 
+def pack_units(units: list[str], max_words: int, overlap: int = 0) -> list[list[str]]:
+    """Greedily group text units (sentences or bullets) into chunk-sized lists."""
+    groups = []
+    current = []
+
+    for unit in units:
+        if current and word_count(" ".join(current + [unit])) > max_words:
+            groups.append(current)
+            current = current[-overlap:] if overlap else []
+        current.append(unit)
+
+    if current:
+        groups.append(current)
+
+    return groups
+
+
+def with_heading(heading: str, body: str) -> str:
+    return f"{heading}\n{body}" if heading else body
+
+
 # ---------------------------------------------------------
-# Structured document detection
+# Resume chunking
 # ---------------------------------------------------------
 
-def is_structured(document) -> bool:
+def is_resume_heading(block: str) -> bool:
+    block = block.strip()
+    if is_resume_section(block):
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", block)
+    return (
+        len(block) <= 40
+        and len(letters) >= 4
+        and block.isupper()
+        and not is_bullet(block)
+    )
+
+
+def resume_units(document):
+    """Turn blocks into (page, kind, text) units using their visual lines.
+
+    kind is "heading", "bullet", or "text". Inside a block, lines that wrap a
+    bullet stay with that bullet and consecutive plain lines are merged, so a
+    block reading "EXPERIENCE / Intern - Honda / June '26 / - Built ..." yields
+    a heading, one text unit, and one bullet unit.
     """
-    Determine whether the document contains enough reliable
-    structure to use structure-aware chunking.
 
-    For the current implementation, we look for multiple
-    strong section signals rather than assuming that one
-    uppercase block means the entire document is structured.
-
-    This can be improved later using PDF layout information.
-    """
-
-    section_count = 0
-
+    units = []
     for page in document:
-        for block in page["blocks"]:
-            if is_section_heading(block):
-                section_count += 1
+        for lines in block_lines(page):
+            current = None
+            previous_line = ""
+            for line in lines:
+                if is_resume_heading(line):
+                    units.append((page["page"], "heading", line))
+                    current = None
+                elif is_bullet(line):
+                    current = [page["page"], "bullet", line]
+                    units.append(current)
+                elif current is not None and (
+                    current[1] == "text" or wraps_previous_line(previous_line, line)
+                ):
+                    current[2] = f"{current[2]} {line}"
+                else:
+                    current = [page["page"], "text", line]
+                    units.append(current)
+                previous_line = line
+    return [tuple(unit) for unit in units]
 
-    # Require at least two sections before calling the
-    # document structurally organized.
-    return section_count >= 2
+
+def wraps_previous_line(previous_line: str, line: str) -> bool:
+    """Whether a plain line after a bullet continues it rather than starting
+    the next entry: "and REST APIs." continues, while "BidBazaar - Auction
+    Platform" after a bullet ending in a period is a new entry title."""
+    return line[:1].islower() or not previous_line.rstrip().endswith((".", "!", "?"))
 
 
-# ---------------------------------------------------------
-# Structured chunking
-# ---------------------------------------------------------
+def resume_chunker(document):
+    """Chunk a resume into one chunk per entry (job, project, degree, skills).
 
-def structured_chunker(document):
+    Within a section, text that follows bullets starts a new entry, so "title,
+    dates, bullets, title, dates, bullets" yields two entries while a list of
+    skill lines stays together. Every chunk is prefixed with
+    "SECTION > entry title" so a split entry keeps its name.
     """
-    Chunk a structured document while preserving detected
-    section and subsection boundaries.
 
-    Within a section, we also try to identify semantic
-    content-group boundaries.
+    max_words = MAX_CHUNK_WORDS[RESUME]
+    entries = []
+    section = ""
+    entry = None
 
-    Size-based splitting is only used when a logical group
-    becomes too large.
-    """
+    def start_entry(page, title):
+        nonlocal entry
+        entry = {"page": page, "section": section, "title": title, "units": [], "has_bullets": False}
+        entries.append(entry)
+
+    for page, kind, text in resume_units(document):
+        if kind == "heading":
+            section = text
+            entry = None
+        elif kind == "bullet":
+            if entry is None:
+                start_entry(page, "")
+            entry["units"].extend(b for b in BULLET_SPLIT.split(text) if b.strip())
+            entry["has_bullets"] = True
+        elif entry is None or entry["has_bullets"]:
+            start_entry(page, text)
+        else:
+            entry["units"].append(text)
 
     chunks = []
-    chunk_index = 0
+    for item in entries:
+        title_line = " > ".join(part for part in (item["section"], item["title"]) if part)
+        units = item["units"] or [""]
 
-    current_section = None
-    current_subsection = None
-
-    current_text = []
-    current_page = None
-
-    def flush_chunk():
-        nonlocal chunk_index
-        nonlocal current_text
-        nonlocal current_page
-
-        if not current_text:
-            return
-
-        text = " ".join(current_text).strip()
-
-        chunks.append(
-            make_chunk(
+        for group in pack_units(units, max_words):
+            body = " ".join(group).strip()
+            text = with_heading(title_line, body)
+            if not text.strip():
+                continue
+            chunks.append(make_chunk(
                 text=text,
-                page=current_page,
-                section=current_section,
-                subsection=current_subsection,
-                chunk_index=chunk_index,
-            )
-        )
-
-        chunk_index += 1
-        current_text = []
-        current_page = None
-
-    for page in document:
-        page_number = page["page"]
-        blocks = page["blocks"]
-
-        for i, raw_block in enumerate(blocks):
-            block = raw_block.strip()
-
-            if not block:
-                continue
-
-            # ---------------------------------------------
-            # Top-level section boundary
-            # ---------------------------------------------
-
-            if is_section_heading(block):
-                flush_chunk()
-
-                current_section = block
-                current_subsection = None
-
-                continue
-
-            # ---------------------------------------------
-            # Explicit subsection boundary
-            # ---------------------------------------------
-
-            if is_subsection_heading(block):
-                flush_chunk()
-
-                current_subsection = block
-
-                continue
-
-            # ---------------------------------------------
-            # Content-group boundary
-            # ---------------------------------------------
-            #
-            # This is checked before adding the current
-            # block to the existing chunk.
-            #
-            # We only split when there is evidence that
-            # this block begins a new logical group.
-            # ---------------------------------------------
-
-            if (
-                current_text
-                and is_content_group_start(blocks, i)
-            ):
-                flush_chunk()
-
-            # ---------------------------------------------
-            # Normal content
-            # ---------------------------------------------
-
-            if current_page is None:
-                current_page = page_number
-
-            candidate = " ".join(
-                current_text + [block]
-            )
-
-            # Size is a safety limit, not the primary
-            # semantic boundary.
-            if (
-                current_text
-                and word_count(candidate) > MAX_CHUNK_WORDS
-            ):
-                flush_chunk()
-                current_page = page_number
-
-            current_text.append(block)
-
-    # Flush final chunk
-    flush_chunk()
+                page=item["page"],
+                document_type=RESUME,
+                section=item["section"],
+                subsection=item["title"][:120],
+                chunk_index=len(chunks),
+            ))
 
     return chunks
+
+
 # ---------------------------------------------------------
-# Fallback chunking
+# Slide chunking
 # ---------------------------------------------------------
 
-def fallback_chunker(document):
-    """
-    Chunk an unstructured document.
+def slides_chunker(document):
+    """One chunk per slide, titled by the slide's first short block.
 
-    Fallback strategy:
-
-        blocks
-          ↓
-        sentences
-          ↓
-        retrieval-sized chunks
-          ↓
-        sentence overlap
-
-    No section or subsection metadata is invented.
+    Near-empty slides (section dividers, "Questions?") are carried forward as
+    a prefix of the next slide instead of becoming fragment chunks.
     """
 
+    max_words = MAX_CHUNK_WORDS[SLIDES]
     chunks = []
-    chunk_index = 0
+    carried = ""
 
-    for page in document:
-        page_number = page["page"]
+    for page in strip_repeated_blocks(document):
+        blocks = [block.strip() for block in page["blocks"] if block.strip()]
+        if not blocks:
+            continue
 
+        title = blocks[0] if word_count(blocks[0]) <= 12 else ""
+        text = " ".join(blocks)
+
+        if word_count(text) < 8:
+            carried = f"{carried} {text}".strip()
+            continue
+
+        heading = " > ".join(part for part in (carried, title) if part)
+        body_blocks = blocks[1:] if title else blocks
+        sentences = split_sentences(" ".join(body_blocks)) or [title]
+        carried = ""
+
+        for group in pack_units(sentences, max_words):
+            chunks.append(make_chunk(
+                text=with_heading(heading, " ".join(group)),
+                page=page["page"],
+                document_type=SLIDES,
+                subsection=title,
+                chunk_index=len(chunks),
+            ))
+
+    return chunks
+
+
+# ---------------------------------------------------------
+# Prose chunking (books, papers, reports, notes)
+# ---------------------------------------------------------
+
+NUMBERED_HEADING = re.compile(r"^(\d{1,3}(\.\d{1,3})*)\.?\s+[A-Z]")
+MULTI_LEVEL_NUMBER = re.compile(r"^\d{1,3}(\.\d{1,3})+\s")
+STRUCTURAL_HEADING = re.compile(r"^(chapter|appendix|part)\s+[\w.]+", re.IGNORECASE)
+
+def is_prose_heading(block: str) -> bool:
+    block = block.strip()
+    words = word_count(block)
+
+    if not block or words > 15 or block.endswith((".", ",", ";", ":")):
+        return False
+
+    if NUMBERED_HEADING.match(block):
+        # Multi-level numbers like "10.2.1" are strong evidence. A single
+        # number ("1 Introduction", "1. Regardless of ...") may be a list
+        # item, so it must also be short.
+        return bool(MULTI_LEVEL_NUMBER.match(block)) or words <= 8
+
+    if STRUCTURAL_HEADING.match(block) and words <= 10:
+        return True
+
+    # Uppercase headings need a real word, so figure labels like "W W W" fail.
+    has_real_word = any(len(word) >= 3 for word in WORD.findall(block))
+    return block.isupper() and has_real_word and words <= 8
+
+
+def prose_chunker(document):
+    """Sentence-packed chunks that respect section headings.
+
+    Math-only fragments and figure label clouds are dropped, except captions
+    and equations, which still carry meaning.
+    """
+
+    max_words = MAX_CHUNK_WORDS[PROSE]
+    chunks = []
+    section = ""
+    sentences = []
+    start_page = None
+
+    def emit(groups):
+        for group in groups:
+            chunks.append(make_chunk(
+                text=" ".join(group),
+                page=start_page,
+                document_type=PROSE,
+                section=section,
+                chunk_index=len(chunks),
+            ))
+
+    def flush():
+        nonlocal sentences, start_page
+        emit(pack_units(sentences, max_words, OVERLAP_SENTENCES))
+        sentences = []
+        start_page = None
+
+    for page in strip_repeated_blocks(document):
         for block in page["blocks"]:
             block = block.strip()
-
             if not block:
                 continue
 
-            sentences = split_sentences(block)
-
-            if not sentences:
+            if is_prose_heading(block):
+                flush()
+                section = block
                 continue
 
-            current_sentences = []
+            keep = (
+                block.startswith(("Figure", "Table"))
+                or "=" in block
+                or noise_ratio(block) <= 0.5
+            )
+            if not keep:
+                continue
 
-            for sentence in sentences:
+            if start_page is None:
+                start_page = page["page"]
 
-                candidate = " ".join(
-                    current_sentences + [sentence]
-                )
+            new_sentences = split_sentences(block)
+            # A sentence broken by a page or column break continues in a block
+            # that starts lowercase; rejoin it instead of starting a fragment.
+            if (
+                sentences
+                and new_sentences
+                and new_sentences[0][:1].islower()
+                and not sentences[-1].rstrip().endswith((".", "!", "?"))
+            ):
+                sentences[-1] = f"{sentences[-1]} {new_sentences.pop(0)}"
+            sentences.extend(new_sentences)
 
-                # If the next sentence would exceed the
-                # target size, save the current chunk.
-                if (
-                    current_sentences
-                    and word_count(candidate) > MAX_CHUNK_WORDS
-                ):
-                    text = " ".join(current_sentences)
+            # Emit full chunks as we go so each chunk's page stays accurate.
+            if word_count(" ".join(sentences)) > max_words:
+                *full, sentences = pack_units(sentences, max_words, OVERLAP_SENTENCES)
+                emit(full)
+                start_page = page["page"]
 
-                    chunks.append(
-                        make_chunk(
-                            text=text,
-                            page=page_number,
-                            section=None,
-                            subsection=None,
-                            chunk_index=chunk_index,
-                        )
-                    )
-
-                    chunk_index += 1
-
-                    # Keep a small amount of context overlap.
-                    current_sentences = current_sentences[
-                        -OVERLAP_SENTENCES:
-                    ]
-
-                current_sentences.append(sentence)
-
-            # Save remaining sentences
-            if current_sentences:
-                text = " ".join(current_sentences)
-
-                chunks.append(
-                    make_chunk(
-                        text=text,
-                        page=page_number,
-                        section=None,
-                        subsection=None,
-                        chunk_index=chunk_index,
-                    )
-                )
-
-                chunk_index += 1
-
+    flush()
     return chunks
 
 
@@ -581,266 +457,16 @@ def fallback_chunker(document):
 # Main chunking function
 # ---------------------------------------------------------
 
-def chunk_document(document):
-    """
-    Main entry point for document chunking.
-
-    Structured documents use their detected hierarchy.
-
-    Unstructured documents use the fallback strategy.
-
-    Both paths return exactly the same normalized chunk
-    representation.
-    """
-
-    if is_structured(document):
-        return structured_chunker(document)
-
-    return fallback_chunker(document)
-
-"""
-CHUNKING NOTES
-==============
-
-Current architecture:
-
-    PDF
-      ↓
-    pdf_reader.py
-      ↓
-    Structured document
-      ↓
-    chunker.py
-      ↓
-    Section detection
-      ↓
-    Semantic / size-controlled chunks
-      ↓
-    Embeddings
-      ↓
-    Vector database
-      ↓
-    Similarity search
-      ↓
-    Retrieve relevant chunks
-      ↓
-    Give context to LLM
-
-
-STRUCTURE-AWARE CHUNKING
-========================
-
-The goal is NOT to create a chunker specifically for resumes.
-
-The goal is to preserve the natural semantic structure of
-different types of documents.
-
-Examples:
-
-Resume:
-    EXPERIENCE
-    PROJECTS
-    TECHNICAL SKILLS
-
-Research paper:
-    INTRODUCTION
-    METHODOLOGY
-    RESULTS
-    CONCLUSION
-
-Documentation:
-    INSTALLATION
-    CONFIGURATION
-    AUTHENTICATION
-    API REFERENCE
-
-Book:
-    CHAPTER 1
-        SECTION 1.1
-        SECTION 1.2
-    CHAPTER 2
-
-Legal document:
-    DEFINITIONS
-    OBLIGATIONS
-    TERMINATION
-    LIABILITY
-
-
-GENERAL CHUNKING PIPELINE
-=========================
-
-    Document
-        ↓
-    Detect structure
-        ↓
-    Identify sections
-        ↓
-    Preserve section boundaries
-        ↓
-    Split oversized sections
-        ↓
-    Split using paragraphs / sentences
-        ↓
-    Add controlled overlap
-        ↓
-    Create retrieval-sized chunks
-
-
-IMPORTANT DESIGN PRINCIPLE
-==========================
-
-First understand the document.
-
-Then decide where to cut it.
-
-Structure detection and chunk sizing are separate concerns.
-
-
-SECTION BOUNDARIES
-==================
-
-Chunks should NOT normally cross semantic section boundaries.
-
-Good:
-
-    PROJECTS
-        ├── Chunk 1
-        ├── Chunk 2
-        └── Chunk 3
-
-    TECHNICAL SKILLS
-        ├── Chunk 4
-        └── Chunk 5
-
-Avoid:
-
-    Chunk 1:
-        end of PROJECTS
-        +
-        beginning of TECHNICAL SKILLS
-
-
-HIERARCHICAL STRUCTURE
-======================
-
-A document may contain multiple levels:
-
-    Section
-        ↓
-    Subsection
-        ↓
-    Paragraph
-        ↓
-    Chunk
-
-Example:
-
-    PROJECTS
-        ↓
-    Real-Time Pronunciation Assessment System
-        ↓
-    Project description
-        ↓
-    Retrieval chunk
-
-
-METADATA
-========
-
-Chunks should eventually preserve metadata such as:
-
-    - page number
-    - section
-    - subsection
-    - chunk index
-
-Example:
-
-    {
-        "text": "...",
-        "page": 1,
-        "section": "PROJECTS",
-        "subsection": "Real-Time Pronunciation Assessment System",
-        "chunk_index": 3
-    }
-
-This metadata will later help with:
-
-    - source citations
-    - debugging retrieval
-    - displaying sources
-    - filtering
-    - reranking
-    - document navigation
-
-
-FALLBACK STRATEGY
-=================
-
-Not every PDF will have obvious sections.
-
-Therefore:
-
-    Structure detected
-        ↓
-    Section-aware chunking
-
-    Structure unavailable
-        ↓
-    Paragraph-aware chunking
-
-    Paragraph structure unavailable
-        ↓
-    Sentence-based chunking
-
-
-CURRENT LIMITATION
-==================
-
-PDF extraction does not always preserve semantic structure perfectly.
-
-For example, extracted text may contain:
-
-    Y ear
-    CGP A
-    F rameworks & T echnologies
-    F eb
-
-These artifacts originate from PDF extraction/layout handling,
-not from the chunking algorithm itself.
-
-Therefore the architecture separates:
-
-    pdf_reader.py
-        ↓
-    Extract and preserve document structure
-
-    chunker.py
-        ↓
-    Interpret structure and create retrieval chunks
-
-
-RAG GOAL
-========
-
-    Document
-        ↓
-    Extract structure
-        ↓
-    Detect semantic boundaries
-        ↓
-    Create meaningful chunks
-        ↓
-    Create embeddings
-        ↓
-    Similarity search
-        ↓
-    Retrieve relevant chunks
-        ↓
-    Rerank / filter
-        ↓
-    Give context to LLM
-        ↓
-    Generate grounded answer
-"""
+CHUNKERS = {
+    RESUME: resume_chunker,
+    SLIDES: slides_chunker,
+    PROSE: prose_chunker,
+}
+
+
+def chunk_document(document, document_type: str | None = None):
+    """Classify the document (unless a type is given) and chunk it."""
+    if document_type is None:
+        document_type = classify_document(document).document_type
+
+    return CHUNKERS[document_type](document)
