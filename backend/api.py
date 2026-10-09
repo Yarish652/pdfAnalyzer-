@@ -1,11 +1,13 @@
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
+import json
 import logging
 from uuid import uuid4
 
 from chromadb.errors import ChromaError
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from openai import OpenAIError
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -21,7 +23,7 @@ from keyword_retriever import retrieve_keyword_chunks
 from reranker import rerank_chunks
 from vector_store import add_documents, get_chunks, search
 from context_builder import expand_with_neighbors, format_context
-from generator import generate_answer, rewrite_query
+from generator import REFUSAL, generate_answer, is_daily_quota_error, rewrite_query, stream_answer
 
 
 logger = logging.getLogger(__name__)
@@ -37,11 +39,36 @@ class AskRequest(BaseModel):
     history: list[dict] = []
 
 
-app = FastAPI()
+def warm_up_models() -> None:
+    """Run each local model once so the first question does not pay setup cost."""
+    embed_texts(["warm up"])
+    rerank_chunks("warm up", [{"text": "warm up", "metadata": {}}])
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    await run_in_threadpool(warm_up_models)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 # This in-memory state is suitable for a single-process development server.
 # Move it to Redis or a database before running multiple application workers.
 upload_jobs: dict[str, str] = {}
+# Details shown to the user: document type and size once ready, or why it failed.
+upload_details: dict[str, dict] = {}
+
+NO_TEXT_REASON = (
+    "This PDF has no selectable text. It is probably a scanned image, "
+    "which is not supported yet."
+)
+GENERIC_FAILURE_REASON = "We couldn't process this PDF. Please try another file."
+
+# Candidates passed to the cross-encoder. Its cost grows linearly with this,
+# and on the benchmarks the top 6 fused results kept the same accuracy as ~16.
+RERANK_CANDIDATES = 6
+CONTEXT_CHUNKS = 3
 
 
 class NonPdfUploadError(Exception):
@@ -85,7 +112,22 @@ def retrieve_context_chunks(query: str, document_id: str) -> list[dict]:
     if not fused_chunks:
         return []
 
-    return expand_with_neighbors(rerank_chunks(query, fused_chunks)[:3], get_chunks)
+    reranked = rerank_chunks(query, fused_chunks[:RERANK_CANDIDATES])
+    return expand_with_neighbors(reranked[:CONTEXT_CHUNKS], get_chunks)
+
+
+def source_payload(chunks: list[dict]) -> list[dict]:
+    """Sources numbered to match the [n] citations in the answer."""
+    sources = []
+    for number, chunk in enumerate(chunks, start=1):
+        metadata = chunk.get("metadata") or {}
+        sources.append({
+            "id": number,
+            "page": metadata.get("page"),
+            "section": metadata.get("section") or metadata.get("subsection") or "",
+            "text": chunk["text"],
+        })
+    return sources
 
 
 def current_correlation_id() -> str:
@@ -162,6 +204,7 @@ async def process_upload(document_id: str, file, correlation_id: str) -> None:
         # Image-only (scanned) PDFs have no text layer; there is nothing to index.
         logger.warning("Upload has no extractable text request_id=%s", correlation_id)
         upload_jobs[document_id] = "failed"
+        upload_details[document_id] = {"reason": NO_TEXT_REASON}
         return
 
     try:
@@ -207,6 +250,11 @@ async def process_upload(document_id: str, file, correlation_id: str) -> None:
         logger.exception("Upload storage failed request_id=%s", correlation_id)
         upload_jobs[document_id] = "failed"
     else:
+        upload_details[document_id] = {
+            "document_type": classification.document_type,
+            "pages": max(page["page"] for page in document),
+            "chunks": len(chunks),
+        }
         upload_jobs[document_id] = "ready"
 
 
@@ -258,22 +306,42 @@ async def upload_status(document_id: str):
     if status is None:
         raise HTTPException(status_code=404, detail="Upload not found.")
 
-    return {"document_id": document_id, "status": status}
+    details = upload_details.get(document_id, {})
+    if status == "failed" and "reason" not in details:
+        details = {**details, "reason": GENERIC_FAILURE_REASON}
+
+    return {"document_id": document_id, "status": status, **details}
 
 
-@app.post("/ask")
-async def ask_question(request: AskRequest):
-    correlation_id = current_correlation_id()
+DAILY_QUOTA_DETAIL = (
+    "The free model's daily request limit has been reached. "
+    "It resets at midnight UTC."
+)
 
+
+def provider_error_detail(error: Exception, default: str) -> str:
+    """A client-safe message; only the daily quota is worth explaining."""
+    return DAILY_QUOTA_DETAIL if is_daily_quota_error(error) else default
+
+
+async def prepare_answer_context(request: AskRequest, correlation_id: str):
+    """Rewrite the question if needed and retrieve its passages.
+
+    Returns (rewritten_query, passages), or an error response to send as is.
+    """
     try:
         rewritten_query = await run_in_threadpool(
             rewrite_query,
             request.question,
             request.history,
         )
-    except OpenAIError:
+    except OpenAIError as error:
         logger.exception("Query rewrite failed request_id=%s", correlation_id)
-        return error_response(502, "Unable to contact the answer service.", correlation_id)
+        return error_response(
+            502,
+            provider_error_detail(error, "Unable to contact the answer service."),
+            correlation_id,
+        )
     except Exception:
         logger.exception("Query rewrite failed request_id=%s", correlation_id)
         return error_response(500, "An unexpected internal error occurred.", correlation_id)
@@ -291,18 +359,32 @@ async def ask_question(request: AskRequest):
         logger.exception("Retrieval failed request_id=%s", correlation_id)
         return error_response(500, "An unexpected internal error occurred.", correlation_id)
 
-    context = format_context(context_chunks)
+    return rewritten_query, context_chunks
+
+
+@app.post("/ask")
+async def ask_question(request: AskRequest):
+    correlation_id = current_correlation_id()
+
+    prepared = await prepare_answer_context(request, correlation_id)
+    if isinstance(prepared, JSONResponse):
+        return prepared
+    rewritten_query, context_chunks = prepared
 
     try:
         answer = await run_in_threadpool(
             generate_answer,
             request.question,
-            context,
+            format_context(context_chunks),
             request.history,
         )
-    except OpenAIError:
+    except OpenAIError as error:
         logger.exception("Answer generation failed request_id=%s", correlation_id)
-        return error_response(502, "Unable to generate an answer at this time.", correlation_id)
+        return error_response(
+            502,
+            provider_error_detail(error, "Unable to generate an answer at this time."),
+            correlation_id,
+        )
     except Exception:
         logger.exception("Answer generation failed request_id=%s", correlation_id)
         return error_response(500, "An unexpected internal error occurred.", correlation_id)
@@ -311,5 +393,63 @@ async def ask_question(request: AskRequest):
         "question": request.question,
         "rewritten_query": rewritten_query,
         "answer": answer,
-        "sources": [chunk["text"] for chunk in context_chunks],
+        "sources": source_payload(context_chunks),
     }
+
+
+def sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/ask/stream")
+async def ask_question_stream(request: AskRequest):
+    """Stream an answer as server-sent events.
+
+    Events: "sources" (sent before generation starts), then "token" deltas,
+    then "done" with the full answer, or "error" if generation fails.
+    Failures before generation return a normal JSON error response.
+    """
+    correlation_id = current_correlation_id()
+
+    prepared = await prepare_answer_context(request, correlation_id)
+    if isinstance(prepared, JSONResponse):
+        return prepared
+    rewritten_query, context_chunks = prepared
+    context = format_context(context_chunks)
+
+    def events():
+        yield sse_event("sources", {
+            "rewritten_query": rewritten_query,
+            "sources": source_payload(context_chunks),
+        })
+
+        parts = []
+        try:
+            for delta in stream_answer(request.question, context, request.history):
+                parts.append(delta)
+                yield sse_event("token", {"text": delta})
+        except OpenAIError as error:
+            logger.exception("Answer streaming failed request_id=%s", correlation_id)
+            yield sse_event("error", {
+                "detail": provider_error_detail(error, "Unable to generate an answer at this time."),
+                "request_id": correlation_id,
+            })
+            return
+        except Exception:
+            logger.exception("Answer streaming failed request_id=%s", correlation_id)
+            yield sse_event("error", {
+                "detail": "An unexpected internal error occurred.",
+                "request_id": correlation_id,
+            })
+            return
+
+        answer = "".join(parts).strip() or REFUSAL
+        yield sse_event("done", {"answer": answer})
+
+    # The generator is synchronous; Starlette iterates it in a worker thread,
+    # so a slow model never blocks the event loop.
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

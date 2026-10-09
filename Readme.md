@@ -29,14 +29,46 @@ When a PDF is uploaded, the backend:
 
 For each question, the backend:
 
-1. Rewrites the query when conversation history requires it.
+1. Rewrites the query with the LLM only when it refers back to the
+   conversation ("How does it work?", "and the decoder?"). Standalone
+   questions skip this call.
 2. Retrieves the top 10 chunks with MPNet vector search.
 3. Retrieves the top 10 chunks with BM25 keyword search.
 4. Fuses both rankings with reciprocal rank fusion.
-5. Reranks the fused candidates with a local cross-encoder and keeps the top 3.
+5. Reranks the top 6 fused candidates with a local cross-encoder (int8 ONNX
+   Runtime build of `ms-marco-MiniLM-L6-v2`) and keeps the top 3.
 6. For prose documents, widens each of those chunks with its neighbors from
    the same section (`context_builder.py`), then sends the passages to the
-   model labelled with their page and section.
+   model numbered and labelled with their page and section.
+7. The model cites passages inline as `[1]`, `[2]`; the response lists the
+   sources with the same numbers.
+
+## API
+
+- `POST /upload` accepts a PDF and returns `202` with a `document_id`.
+- `GET /upload/{document_id}/status` returns `pending`, `processing`,
+  `ready` (with `document_type`, `pages`, and `chunks`), or `failed` (with a
+  user-facing `reason`, for example for scanned PDFs).
+- `POST /ask/stream` streams the answer as server-sent events: `sources`
+  first (as soon as retrieval finishes), then `token` deltas, then `done`
+  with the full answer, or `error`. The frontend uses this endpoint.
+- `POST /ask` returns the same answer and sources as one JSON response.
+
+Each source is `{"id", "page", "section", "text"}`, where `id` matches the
+`[n]` citations in the answer.
+
+### Latency
+
+Measured on the development laptop (CPU only):
+
+| Step | Before | After |
+|---|---|---|
+| Local retrieval per question | ~990 ms | ~550 ms (6 rerank candidates, ONNX int8 reranker) |
+| Query rewrite for standalone follow-ups | one LLM round trip | skipped |
+| Time until the answer starts appearing | full generation time | first streamed token |
+
+Models are warmed up when the server starts, so the first question does not
+pay their setup cost.
 
 The vector store is persisted locally under `backend/chroma_db/`. It is runtime
 data and is intentionally excluded from Git. Upload a document locally before
@@ -52,7 +84,7 @@ immediately, since retrying cannot succeed until the quota resets.
 Create and activate a Python virtual environment, then install the backend packages:
 
 ```bash
-pip install fastapi "uvicorn[standard]" python-multipart pypdf pymupdf chromadb sentence-transformers openai python-dotenv nltk tenacity
+pip install fastapi "uvicorn[standard]" python-multipart pypdf pymupdf chromadb sentence-transformers onnxruntime openai python-dotenv nltk tenacity
 python -m nltk.downloader punkt punkt_tab
 ```
 
@@ -91,7 +123,7 @@ npm install
 npm run dev
 ```
 
-The Vite development server proxies `/upload` and `/ask` to the backend at `http://127.0.0.1:8000`.
+The Vite development server proxies `/upload` and `/ask` (including `/ask/stream`) to the backend at `http://127.0.0.1:8000`.
 
 ## Tests
 
@@ -170,7 +202,7 @@ The evaluation implementation is in
 
 1. Open the frontend URL shown by Vite.
 2. Upload a PDF. The API returns `202 Accepted` with a `document_id` while processing continues in the background.
-3. Poll `GET /upload/{document_id}/status` until its status is `ready`, then ask questions about the document. Include the `document_id` in each `/ask` request.
-4. Expand an answer's **Sources** section to inspect the retrieved chunks.
+3. Poll `GET /upload/{document_id}/status` until its status is `ready`, then ask questions about the document. Include the `document_id` in each `/ask/stream` or `/ask` request.
+4. Answers stream in as they are generated; use **Stop** to cancel one. Click a citation such as `[1]`, or a source card, to read the passage with its page and section.
 
 Uploading another PDF starts a new in-memory conversation.
