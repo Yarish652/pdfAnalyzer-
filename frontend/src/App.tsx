@@ -1,170 +1,187 @@
-import { type ChangeEvent, type DragEvent, type FormEvent, type ReactNode, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
+import {
+  ApiError,
+  type DocumentInfo,
+  type DocumentType,
+  type HistoryMessage,
+  type UploadPhase,
+  streamAnswer,
+  uploadPdf,
+} from "./api";
+import { ChatScreen } from "./components/ChatScreen";
+import { UploadScreen } from "./components/UploadScreen";
+import type { AssistantMessage, ChatMessage } from "./types";
 
-type ConversationMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  sources?: string[];
+const TYPE_LABELS: Record<DocumentType, string> = {
+  prose: "Document",
+  slides: "Slides",
+  resume: "Resume",
 };
 
-type AskResponse = { question: string; rewritten_query: string; answer: string; sources: string[] };
-type UploadResponse = { success: boolean; filename: string; document_id: string; status: string };
-type UploadStatusResponse = { document_id: string; status: "pending" | "processing" | "ready" | "failed" };
+// Earlier turns sent with each question. Fewer turns means a shorter prompt
+// and a faster answer; follow-ups rarely need more than the last few.
+const HISTORY_MESSAGES = 6;
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const OFFLINE_MESSAGE = "We couldn't reach the server. Check that the backend is running.";
+
+function toHistory(messages: ChatMessage[]): HistoryMessage[] {
+  return messages
+    .filter((message) => message.role === "user" || message.status === "done")
+    .slice(-HISTORY_MESSAGES)
+    .map(({ role, content }) => ({ role, content }));
+}
 
 function App() {
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [documentName, setDocumentName] = useState<string | null>(null);
-  const [documentId, setDocumentId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<ConversationMessage[]>([]);
-  const [question, setQuestion] = useState("");
+  const [doc, setDoc] = useState<DocumentInfo | null>(null);
+  const [uploadPhase, setUploadPhase] = useState<UploadPhase | null>(null);
+  const [uploadFileName, setUploadFileName] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState("");
-  const [chatError, setChatError] = useState("");
-  const [isUploading, setIsUploading] = useState(false);
-  const [isAsking, setIsAsking] = useState(false);
-  const [isDragging, setIsDragging] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isAnswering, setIsAnswering] = useState(false);
 
-  function selectFile(file: File | undefined) {
-    if (!file) return;
-    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
-      setSelectedFile(null);
-      setUploadError("Please choose a PDF file.");
-      return;
-    }
-    setSelectedFile(file);
-    setUploadError("");
-  }
+  // Callbacks read the latest messages through a ref so they stay stable and
+  // memoized messages are not re-rendered on every streamed token.
+  const messagesRef = useRef(messages);
+  const abortRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
-  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    selectFile(event.target.files?.[0]);
-  }
-
-  function handleDrop(event: DragEvent<HTMLLabelElement>) {
-    event.preventDefault();
-    setIsDragging(false);
-    selectFile(event.dataTransfer.files[0]);
-  }
-
-  async function handleUpload() {
-    if (!selectedFile || isUploading) return;
-    setIsUploading(true);
-    setUploadError("");
-    const formData = new FormData();
-    formData.append("file", selectedFile);
-
-    try {
-      const response = await fetch(`${API_BASE_URL}/upload`, { method: "POST", body: formData });
-      if (!response.ok) throw new Error("upload failed");
-      const data: UploadResponse = await response.json();
-      if (!data.success) throw new Error("upload failed");
-
-      let status = data.status;
-      while (status === "pending" || status === "processing") {
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
-        const statusResponse = await fetch(`${API_BASE_URL}/upload/${data.document_id}/status`);
-        if (!statusResponse.ok) throw new Error("upload failed");
-        const statusData: UploadStatusResponse = await statusResponse.json();
-        status = statusData.status;
-      }
-      if (status !== "ready") throw new Error("upload failed");
-
-      setDocumentName(data.filename || selectedFile.name);
-      setDocumentId(data.document_id);
-      setMessages([]);
-      setQuestion("");
-      setChatError("");
-    } catch {
-      setUploadError("We couldn't process that PDF. Please try again.");
-    } finally {
-      setIsUploading(false);
-    }
-  }
-
-  async function handleAsk(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const trimmedQuestion = question.trim();
-    if (!documentName || !documentId || !trimmedQuestion || isAsking) return;
-
-    const userMessage: ConversationMessage = { id: crypto.randomUUID(), role: "user", content: trimmedQuestion };
-    const history = messages.map(({ role, content }) => ({ role, content }));
-    setMessages((currentMessages) => [...currentMessages, userMessage]);
-    setQuestion("");
-    setChatError("");
-    setIsAsking(true);
-
-    try {
-      const response = await fetch(`${API_BASE_URL}/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: trimmedQuestion, document_id: documentId, history }),
-      });
-      if (!response.ok) throw new Error(response.status === 502 ? "generation unavailable" : "ask failed");
-      const data: AskResponse = await response.json();
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        { id: crypto.randomUUID(), role: "assistant", content: data.answer, sources: data.sources },
-      ]);
-    } catch (error) {
-      setChatError(
-        error instanceof Error && error.message === "generation unavailable"
-          ? "The answer service is temporarily unavailable. Please try again."
-          : "We couldn't answer that question. Please try again."
+  const updateAnswer = useCallback(
+    (id: string, patch: Partial<AssistantMessage> | ((message: AssistantMessage) => Partial<AssistantMessage>)) => {
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === id && message.role === "assistant"
+            ? { ...message, ...(typeof patch === "function" ? patch(message) : patch) }
+            : message,
+        ),
       );
+    },
+    [],
+  );
+
+  const send = useCallback(
+    async (question: string) => {
+      if (!doc || abortRef.current) return;
+
+      const history = toHistory(messagesRef.current);
+      const answerId = crypto.randomUUID();
+      setMessages((current) => [
+        ...current,
+        { id: crypto.randomUUID(), role: "user", content: question },
+        { id: answerId, role: "assistant", content: "", sources: [], status: "searching", question },
+      ]);
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setIsAnswering(true);
+
+      // Batch streamed tokens into one state update per animation frame.
+      let pending = "";
+      let frame = 0;
+      const flush = () => {
+        frame = 0;
+        if (!pending) return;
+        const text = pending;
+        pending = "";
+        updateAnswer(answerId, (message) => ({ content: message.content + text, status: "streaming" }));
+      };
+
+      try {
+        const answer = await streamAnswer(
+          { question, documentId: doc.id, history },
+          {
+            onSources: (sources) => updateAnswer(answerId, { sources, status: "streaming" }),
+            onToken: (text) => {
+              pending += text;
+              if (!frame) frame = window.requestAnimationFrame(flush);
+            },
+          },
+          controller.signal,
+        );
+        window.cancelAnimationFrame(frame);
+        updateAnswer(answerId, { content: answer, status: "done" });
+      } catch (error) {
+        window.cancelAnimationFrame(frame);
+        flush();
+        if (error instanceof DOMException && error.name === "AbortError") {
+          updateAnswer(answerId, { status: "stopped" });
+        } else {
+          updateAnswer(answerId, {
+            status: "error",
+            error: error instanceof ApiError ? error.message : OFFLINE_MESSAGE,
+          });
+        }
+      } finally {
+        abortRef.current = null;
+        setIsAnswering(false);
+      }
+    },
+    [doc, updateAnswer],
+  );
+
+  const stop = useCallback(() => abortRef.current?.abort(), []);
+
+  async function handleUpload(file: File) {
+    setUploadError("");
+    setUploadFileName(file.name);
+    try {
+      const info = await uploadPdf(file, setUploadPhase);
+      setMessages([]);
+      setDoc(info);
+    } catch (error) {
+      setUploadError(error instanceof ApiError ? error.message : OFFLINE_MESSAGE);
     } finally {
-      setIsAsking(false);
+      setUploadPhase(null);
     }
+  }
+
+  function startOver() {
+    abortRef.current?.abort();
+    setDoc(null);
+    setMessages([]);
+    setUploadError("");
   }
 
   return (
-    <main className="app-shell">
-      <header className="app-header">
-        <div className="brand-mark" aria-hidden="true">P</div>
-        <div><h1>PDF Assistant</h1><p>Ask questions about your documents.</p></div>
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+              <path d="M14 3v5h5M9 13h6M9 17h4" />
+            </svg>
+          </span>
+          <span className="brand-name">PDF Assistant</span>
+        </div>
+
+        {doc && (
+          <div className="doc-bar">
+            <div className="doc-chip" title={doc.name}>
+              <span className="doc-name">{doc.name}</span>
+              <span className="doc-meta">
+                {TYPE_LABELS[doc.documentType ?? "prose"]}
+                {doc.pages ? ` · ${doc.pages} ${doc.pages === 1 ? "page" : "pages"}` : ""}
+              </span>
+            </div>
+            <button type="button" className="secondary-button" onClick={startOver}>
+              New document
+            </button>
+          </div>
+        )}
       </header>
 
-      <section className="upload-panel" aria-labelledby="upload-title">
-        <div className="section-heading">
-          <div><span className="eyebrow">Document</span><h2 id="upload-title">Upload a PDF to begin</h2></div>
-          {documentName && <span className="ready-badge">Ready to chat</span>}
-        </div>
-        <label className={`drop-zone ${isDragging ? "is-dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop}>
-          <input type="file" accept="application/pdf,.pdf" onChange={handleFileChange} />
-          <span className="upload-icon" aria-hidden="true">↑</span>
-          <span className="drop-zone-copy"><strong>{selectedFile ? selectedFile.name : "Drop your PDF here"}</strong><span>{selectedFile ? "Choose another file" : "or browse files from your computer"}</span></span>
-        </label>
-        <div className="upload-actions">
-          <p className="upload-help">PDF files only. Uploading a new document starts a fresh conversation.</p>
-          <button className="primary-button" type="button" onClick={handleUpload} disabled={!selectedFile || isUploading}>{isUploading ? "Processing document…" : "Process PDF"}</button>
-        </div>
-        {uploadError && <p className="error-message" role="alert">{uploadError}</p>}
-      </section>
-
-      <section className={`chat-panel ${!documentName ? "is-disabled" : ""}`} aria-labelledby="chat-title">
-        <div className="section-heading"><div><span className="eyebrow">Conversation</span><h2 id="chat-title">{documentName ?? "Your document chat"}</h2></div></div>
-        <div className="message-list" aria-live="polite">
-          {!documentName ? <EmptyState icon="⌁" title="Upload a document first">Once it has been processed, you can ask questions grounded in its contents.</EmptyState>
-            : messages.length === 0 ? <EmptyState icon="✦" title="What would you like to know?">Ask about details, concepts, or anything else in <strong>{documentName}</strong>.</EmptyState>
-              : messages.map((message) => <article key={message.id} className={`message message-${message.role}`}>
-                <span className="message-label">{message.role === "user" ? "You" : "PDF Assistant"}</span><p>{message.content}</p>
-                {message.role === "assistant" && message.sources && message.sources.length > 0 && <details className="sources"><summary>Sources <span>{message.sources.length}</span></summary><ol>{message.sources.map((source, index) => <li key={index}>{source}</li>)}</ol></details>}
-              </article>)}
-          {isAsking && <div className="assistant-loading"><span /><span /><span /> Finding an answer</div>}
-        </div>
-        {chatError && <p className="error-message chat-error" role="alert">{chatError}</p>}
-        <form className="question-form" onSubmit={handleAsk}>
-          <label className="sr-only" htmlFor="question">Ask a question about the PDF</label>
-          <textarea id="question" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder={documentName ? "Ask a question about this document…" : "Upload a PDF to start asking questions"} rows={2} disabled={!documentName || isAsking} />
-          <button className="send-button" type="submit" disabled={!documentName || !question.trim() || isAsking} aria-label="Send question">{isAsking ? "…" : "→"}</button>
-        </form>
-      </section>
-    </main>
+      <main className="workspace">
+        {doc ? (
+          <ChatScreen doc={doc} messages={messages} isAnswering={isAnswering} onSend={send} onStop={stop} />
+        ) : (
+          <UploadScreen phase={uploadPhase} fileName={uploadFileName} error={uploadError} onUpload={handleUpload} />
+        )}
+      </main>
+    </div>
   );
-}
-
-function EmptyState({ icon, title, children }: { icon: string; title: string; children: ReactNode }) {
-  return <div className="empty-state"><span className="empty-icon" aria-hidden="true">{icon}</span><h3>{title}</h3><p>{children}</p></div>;
 }
 
 export default App;

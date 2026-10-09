@@ -275,7 +275,14 @@ class GenerationTests(unittest.TestCase):
 
             body = response
             self.assertEqual(body["rewritten_query"], "rewritten question")
-            self.assertEqual(body["sources"], ["top one", "top two", "top three"])
+            self.assertEqual(
+                body["sources"],
+                [
+                    {"id": 1, "page": None, "section": "", "text": "top one"},
+                    {"id": 2, "page": None, "section": "", "text": "top two"},
+                    {"id": 3, "page": None, "section": "", "text": "top three"},
+                ],
+            )
             self.assertEqual(
                 generation_calls,
                 [("original question", "[1]\ntop one\n\n[2]\ntop two\n\n[3]\ntop three", [])],
@@ -473,6 +480,28 @@ class DocumentIsolationTests(unittest.TestCase):
         self.assertEqual(asyncio.run(upload()), "failed")
         self.assertEqual(self.collection.add_calls, [])
 
+    def test_status_reports_document_details_and_failure_reason(self):
+        async def upload(contents):
+            background_tasks = BackgroundTasks()
+            response = await api.upload_pdf(
+                background_tasks,
+                UploadFile(filename="doc.pdf", file=BytesIO(contents)),
+            )
+            document_id = json.loads(response.body)["document_id"]
+            await background_tasks()
+            return await api.upload_status(document_id)
+
+        ready = asyncio.run(upload(b"text"))
+        self.assertEqual(
+            {key: ready[key] for key in ("status", "document_type", "pages", "chunks")},
+            {"status": "ready", "document_type": "prose", "pages": 1, "chunks": 1},
+        )
+
+        api.extract_document = lambda _file: []
+        failed = asyncio.run(upload(b"scan"))
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("scanned image", failed["reason"])
+
 
 class EventLoopConcurrencyTests(unittest.TestCase):
     def test_concurrent_asks_do_not_block_each_other(self):
@@ -579,6 +608,164 @@ class HybridRetrievalTests(unittest.TestCase):
             api.retrieve_keyword_chunks = original_keyword
             api.reciprocal_rank_fusion = original_fusion
             api.rerank_chunks = original_rerank
+
+
+class RerankCandidateTests(unittest.TestCase):
+    def test_only_top_fused_candidates_are_reranked(self):
+        originals = (
+            api.embed_texts, api.search, api.retrieve_keyword_chunks,
+            api.reciprocal_rank_fusion, api.rerank_chunks,
+        )
+        reranked_counts = []
+        try:
+            api.embed_texts = lambda texts: _Embeddings()
+            api.search = lambda *_args, **_kwargs: {"documents": [[]], "metadatas": [[]]}
+            api.retrieve_keyword_chunks = lambda *_args, **_kwargs: []
+            api.reciprocal_rank_fusion = lambda _lists: [
+                {"text": f"chunk {index}", "metadata": {}} for index in range(10)
+            ]
+
+            def rerank(_query, chunks):
+                reranked_counts.append(len(chunks))
+                return chunks
+
+            api.rerank_chunks = rerank
+
+            result = api.retrieve_context_chunks("query", "document-a")
+
+            self.assertEqual(reranked_counts, [api.RERANK_CANDIDATES])
+            self.assertEqual(len(result), 3)
+        finally:
+            (
+                api.embed_texts, api.search, api.retrieve_keyword_chunks,
+                api.reciprocal_rank_fusion, api.rerank_chunks,
+            ) = originals
+
+
+def read_events(response) -> list[tuple[str, dict]]:
+    async def collect():
+        return "".join([
+            part if isinstance(part, str) else part.decode()
+            async for part in response.body_iterator
+        ])
+
+    events = []
+    for block in asyncio.run(collect()).strip().split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.split("\n"))
+        events.append((lines["event"], json.loads(lines["data"])))
+    return events
+
+
+class StreamingTests(unittest.TestCase):
+    def setUp(self):
+        self.originals = (api.rewrite_query, api.retrieve_context_chunks, api.stream_answer)
+        api.rewrite_query = lambda question, history: question
+        api.retrieve_context_chunks = lambda query, document_id: [
+            {"text": "Passage text.", "metadata": {"page": 7, "section": "10.3 Bidirectional RNNs"}},
+        ]
+        self.request = api.AskRequest(question="Question?", document_id="document-a", history=[])
+
+    def tearDown(self):
+        api.rewrite_query, api.retrieve_context_chunks, api.stream_answer = self.originals
+
+    def test_stream_sends_sources_then_tokens_then_done(self):
+        api.stream_answer = lambda question, context, history: iter(["Bidirectional ", "RNNs [1]."])
+
+        events = read_events(asyncio.run(api.ask_question_stream(self.request)))
+
+        self.assertEqual([name for name, _ in events], ["sources", "token", "token", "done"])
+        self.assertEqual(
+            events[0][1]["sources"],
+            [{"id": 1, "page": 7, "section": "10.3 Bidirectional RNNs", "text": "Passage text."}],
+        )
+        self.assertEqual(events[-1][1], {"answer": "Bidirectional RNNs [1]."})
+
+    def test_empty_stream_finishes_with_refusal(self):
+        api.stream_answer = lambda question, context, history: iter([])
+
+        events = read_events(asyncio.run(api.ask_question_stream(self.request)))
+
+        self.assertEqual(events[-1], ("done", {"answer": generator.REFUSAL}))
+
+    def test_provider_failure_mid_stream_sends_error_event_without_details(self):
+        def failing_stream(question, context, history):
+            yield "Partial "
+            raise OpenAIError("secret OpenRouter failure")
+
+        api.stream_answer = failing_stream
+
+        events = read_events(asyncio.run(api.ask_question_stream(self.request)))
+
+        self.assertEqual([name for name, _ in events], ["sources", "token", "error"])
+        self.assertEqual(events[-1][1]["detail"], "Unable to generate an answer at this time.")
+        self.assertNotIn("secret", json.dumps(events))
+
+    def test_daily_quota_is_explained_to_the_user(self):
+        def quota_stream(question, context, history):
+            response = httpx.Response(429, request=httpx.Request("POST", "https://openrouter.ai/api"))
+            raise RateLimitError("Rate limit exceeded: free-models-per-day", response=response, body=None)
+            yield  # pragma: no cover - makes this a generator
+
+        api.stream_answer = quota_stream
+
+        events = read_events(asyncio.run(api.ask_question_stream(self.request)))
+
+        self.assertEqual(events[-1][0], "error")
+        self.assertIn("daily request limit", events[-1][1]["detail"])
+
+    def test_failure_before_streaming_returns_json_error(self):
+        def fail_retrieve(query, document_id):
+            raise ChromaError("secret Chroma failure")
+
+        api.retrieve_context_chunks = fail_retrieve
+
+        response = asyncio.run(api.ask_question_stream(self.request))
+
+        self.assertEqual(response.status_code, 502)
+
+
+class RewriteDecisionTests(unittest.TestCase):
+    HISTORY = [{"role": "user", "content": "What is an LSTM?"}]
+
+    def test_standalone_questions_skip_the_rewrite_call(self):
+        for question in [
+            "What does the forget gate do in an LSTM?",
+            "Explain the encoder-decoder architecture.",
+        ]:
+            self.assertFalse(generator.needs_rewrite(question, self.HISTORY), question)
+
+    def test_follow_up_questions_are_rewritten(self):
+        for question in ["How does it work?", "why?", "What about GRUs?", "and the decoder?"]:
+            self.assertTrue(generator.needs_rewrite(question, self.HISTORY), question)
+
+    def test_no_history_never_rewrites(self):
+        self.assertFalse(generator.needs_rewrite("How does it work?", []))
+
+
+class StreamAnswerTests(unittest.TestCase):
+    def test_stream_answer_yields_text_deltas_and_skips_empty_events(self):
+        def chunk(content):
+            delta = type("Delta", (), {"content": content})()
+            choice = type("Choice", (), {"delta": delta})()
+            return type("Event", (), {"choices": [choice]})()
+
+        calls = []
+
+        class StreamingCompletions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                return iter([chunk("Hello"), chunk(None), type("Event", (), {"choices": []})(), chunk(" world")])
+
+        original_client = generator.client
+        generator.client = type(
+            "Client", (), {"chat": type("Chat", (), {"completions": StreamingCompletions()})()}
+        )()
+        try:
+            self.assertEqual(list(generator.stream_answer("Q", "Context", [])), ["Hello", " world"])
+            self.assertTrue(calls[0]["stream"])
+            self.assertIn("cite it with its number", calls[0]["messages"][0]["content"])
+        finally:
+            generator.client = original_client
 
 
 if __name__ == "__main__":

@@ -50,6 +50,8 @@ REFUSAL_TEXT = ""
 
 TOP_K = 10
 FINAL_K = 3
+# Must match api.RERANK_CANDIDATES (api.py cannot be imported from the repo root).
+RERANK_CANDIDATES = 6
 FRAGMENT_WORDS = 15
 WORD_PATTERN = re.compile(r"[A-Za-z]{2,}")
 
@@ -194,12 +196,18 @@ def retrieve_bm25(query: str, document_id: str) -> list[dict]:
 
 
 def retrieve_v2(query: str, document_id: str) -> list[dict]:
-    """Mirror api.retrieve_context_chunks without truncating to FINAL_K."""
+    """Mirror api.retrieve_context_chunks without truncating to FINAL_K.
+
+    Like the API, only the top RERANK_CANDIDATES fused results are reranked;
+    the rest keep their fused order so deeper metrics such as Hit@10 still work.
+    """
     fused = reciprocal_rank_fusion([
         retrieve_mpnet(query, document_id),
         retrieve_bm25(query, document_id),
     ])
-    return rerank_chunks(query, fused) if fused else []
+    if not fused:
+        return []
+    return rerank_chunks(query, fused[:RERANK_CANDIDATES]) + fused[RERANK_CANDIDATES:]
 
 
 RETRIEVERS = {
