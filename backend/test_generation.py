@@ -38,9 +38,13 @@ class _Completions:
 class GenerationTests(unittest.TestCase):
     def setUp(self):
         self.original_client = generator.client
+        self.original_sleep = generator._create_completion.retry.sleep
+        self.retry_sleeps = []
+        generator._create_completion.retry.sleep = self.retry_sleeps.append
 
     def tearDown(self):
         generator.client = self.original_client
+        generator._create_completion.retry.sleep = self.original_sleep
 
     def _set_generation_response(self, content):
         completions = _Completions(content)
@@ -87,6 +91,34 @@ class GenerationTests(unittest.TestCase):
 
         self.assertEqual(answer, "retried answer")
         self.assertEqual(completions.calls, 2)
+        self.assertGreaterEqual(self.retry_sleeps[0], 2)
+
+    def test_daily_quota_rate_limit_is_not_retried(self):
+        class QuotaCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                response = httpx.Response(
+                    429,
+                    request=httpx.Request("POST", "https://openrouter.ai/api"),
+                )
+                raise RateLimitError(
+                    "Rate limit exceeded: free-models-per-day",
+                    response=response,
+                    body=None,
+                )
+
+        completions = QuotaCompletions()
+        generator.client = type(
+            "Client", (), {"chat": type("Chat", (), {"completions": completions})()}
+        )()
+
+        with self.assertRaises(RateLimitError):
+            generator.generate_answer("Question", "Context", [])
+        self.assertEqual(completions.calls, 1)
+        self.assertEqual(self.retry_sleeps, [])
 
     def test_rewrite_query_skips_llm_without_history(self):
         completions = self._set_generation_response("should not be used")
@@ -246,7 +278,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(body["sources"], ["top one", "top two", "top three"])
             self.assertEqual(
                 generation_calls,
-                [("original question", "top one\n\ntop two\n\ntop three", [])],
+                [("original question", "[1]\ntop one\n\n[2]\ntop two\n\n[3]\ntop three", [])],
             )
         finally:
             api.rewrite_query = original_rewrite
@@ -371,7 +403,7 @@ class DocumentIsolationTests(unittest.TestCase):
         __import__("vector_store").collection = self.collection
 
         api.extract_document = lambda _file: [{"page": 1, "blocks": ["text"]}]
-        api.chunk_document = lambda _document: [{
+        api.chunk_document = lambda _document, _document_type=None: [{
             "text": "text",
             "metadata": {"page": 1, "chunk_index": 0},
         }]
@@ -402,6 +434,10 @@ class DocumentIsolationTests(unittest.TestCase):
             return document_id
 
         first_document_id = asyncio.run(upload("first.pdf", b"first"))
+        self.assertEqual(
+            self.collection.add_calls[0]["metadatas"][0]["document_id"],
+            first_document_id,
+        )
         second_document_id = asyncio.run(upload("second.pdf", b"second"))
 
         self.assertNotEqual(first_document_id, second_document_id)
@@ -419,6 +455,23 @@ class DocumentIsolationTests(unittest.TestCase):
             self.collection.query_calls[-1]["where"],
             {"document_id": first_document_id},
         )
+
+
+    def test_image_only_pdf_marks_upload_failed_without_storing(self):
+        api.extract_document = lambda _file: []
+
+        async def upload():
+            background_tasks = BackgroundTasks()
+            response = await api.upload_pdf(
+                background_tasks,
+                UploadFile(filename="scan.pdf", file=BytesIO(b"scan")),
+            )
+            document_id = json.loads(response.body)["document_id"]
+            await background_tasks()
+            return (await api.upload_status(document_id))["status"]
+
+        self.assertEqual(asyncio.run(upload()), "failed")
+        self.assertEqual(self.collection.add_calls, [])
 
 
 class EventLoopConcurrencyTests(unittest.TestCase):

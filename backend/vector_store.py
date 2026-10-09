@@ -63,6 +63,19 @@ def search(query_embedding, document_id, top_k=3):
     return results
 
 
+def get_chunks(document_id, chunk_indexes):
+    """Fetch stored chunks of one document by chunk index."""
+    results = collection.get(
+        ids=[f"{document_id}:{index}" for index in chunk_indexes],
+        include=["documents", "metadatas"],
+    )
+
+    return [
+        {"text": text, "metadata": metadata or {}}
+        for text, metadata in zip(results.get("documents") or [], results.get("metadatas") or [])
+    ]
+
+
 def print_document_diagnostics():
     """Print document IDs, chunk counts, and one sample chunk per document."""
     results = collection.get(include=["documents", "metadatas"])

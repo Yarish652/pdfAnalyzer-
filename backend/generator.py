@@ -1,7 +1,10 @@
 from openai import APIConnectionError, OpenAI, RateLimitError
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-from backend.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
+try:
+    from backend.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
+except ModuleNotFoundError:
+    from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
 
 client = OpenAI(
     base_url=OPENROUTER_BASE_URL,
@@ -9,10 +12,18 @@ client = OpenAI(
 )
 
 
+def _is_transient(error: BaseException) -> bool:
+    """Per-minute rate limits and connection drops clear up; a daily quota does not."""
+    if isinstance(error, RateLimitError):
+        return "per-day" not in str(error)
+    return isinstance(error, APIConnectionError)
+
+
 @retry(
-    retry=retry_if_exception_type((RateLimitError, APIConnectionError)),
-    wait=wait_exponential(multiplier=0.01, min=0.01, max=0.1),
-    stop=stop_after_attempt(3),
+    retry=retry_if_exception(_is_transient),
+    # Free-tier per-minute limits reset over seconds, so back off 2s, 4s, 8s.
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(4),
     reraise=True,
 )
 def _create_completion(**kwargs):

@@ -14,11 +14,13 @@ from config import MAX_PDF_PAGES, MAX_UPLOAD_SIZE_BYTES
 
 from pdf_reader import extract_document
 from chunker import chunk_document
+from document_classifier import classify_document
 from embedding import embed_texts
 from hybrid_retriever import reciprocal_rank_fusion
 from keyword_retriever import retrieve_keyword_chunks
 from reranker import rerank_chunks
-from vector_store import add_documents, search
+from vector_store import add_documents, get_chunks, search
+from context_builder import expand_with_neighbors, format_context
 from generator import generate_answer, rewrite_query
 
 
@@ -59,7 +61,7 @@ class PageLimitExceededError(Exception):
 
 
 def retrieve_context_chunks(query: str, document_id: str) -> list[dict]:
-    """Retrieve, fuse, and rerank candidates for one question."""
+    """Retrieve, fuse, and rerank candidates, then widen them into passages."""
     query_embedding = embed_texts([query])
     vector_results = search(query_embedding, document_id, top_k=10)
 
@@ -83,7 +85,7 @@ def retrieve_context_chunks(query: str, document_id: str) -> list[dict]:
     if not fused_chunks:
         return []
 
-    return rerank_chunks(query, fused_chunks)[:3]
+    return expand_with_neighbors(rerank_chunks(query, fused_chunks)[:3], get_chunks)
 
 
 def current_correlation_id() -> str:
@@ -156,14 +158,36 @@ async def process_upload(document_id: str, file, correlation_id: str) -> None:
         upload_jobs[document_id] = "failed"
         return
 
+    if not document:
+        # Image-only (scanned) PDFs have no text layer; there is nothing to index.
+        logger.warning("Upload has no extractable text request_id=%s", correlation_id)
+        upload_jobs[document_id] = "failed"
+        return
+
     try:
-        chunks = await run_in_threadpool(chunk_document, document)
+        classification = classify_document(document)
+        logger.info(
+            "Classified upload as %s (%s) request_id=%s",
+            classification.document_type,
+            "; ".join(classification.reasons),
+            correlation_id,
+        )
+        chunks = await run_in_threadpool(
+            chunk_document,
+            document,
+            classification.document_type,
+        )
         for chunk in chunks:
             chunk["metadata"]["document_id"] = document_id
 
         texts = [chunk["text"] for chunk in chunks]
     except Exception:
         logger.exception("Upload chunking failed request_id=%s", correlation_id)
+        upload_jobs[document_id] = "failed"
+        return
+
+    if not chunks:
+        logger.warning("Upload produced no chunks request_id=%s", correlation_id)
         upload_jobs[document_id] = "failed"
         return
 
@@ -267,7 +291,7 @@ async def ask_question(request: AskRequest):
         logger.exception("Retrieval failed request_id=%s", correlation_id)
         return error_response(500, "An unexpected internal error occurred.", correlation_id)
 
-    context = "\n\n".join(chunk["text"] for chunk in context_chunks)
+    context = format_context(context_chunks)
 
     try:
         answer = await run_in_threadpool(
