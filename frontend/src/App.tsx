@@ -5,7 +5,7 @@ import {
   type DocumentInfo,
   type DocumentType,
   type HistoryMessage,
-  type UploadPhase,
+  type UploadProgress,
   streamAnswer,
   uploadPdf,
 } from "./api";
@@ -34,7 +34,7 @@ function toHistory(messages: ChatMessage[]): HistoryMessage[] {
 
 function App() {
   const [doc, setDoc] = useState<DocumentInfo | null>(null);
-  const [uploadPhase, setUploadPhase] = useState<UploadPhase | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [uploadFileName, setUploadFileName] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -127,13 +127,13 @@ function App() {
     setUploadError("");
     setUploadFileName(file.name);
     try {
-      const info = await uploadPdf(file, setUploadPhase);
+      const info = await uploadPdf(file, setUploadProgress);
       setMessages([]);
       setDoc(info);
     } catch (error) {
       setUploadError(error instanceof ApiError ? error.message : OFFLINE_MESSAGE);
     } finally {
-      setUploadPhase(null);
+      setUploadProgress(null);
     }
   }
 
@@ -163,6 +163,7 @@ function App() {
               <span className="doc-name">{doc.name}</span>
               <span className="doc-meta">
                 {TYPE_LABELS[doc.documentType ?? "prose"]}
+                {doc.ocrPages ? " · Scanned" : ""}
                 {doc.pages ? ` · ${doc.pages} ${doc.pages === 1 ? "page" : "pages"}` : ""}
               </span>
             </div>
@@ -177,7 +178,7 @@ function App() {
         {doc ? (
           <ChatScreen doc={doc} messages={messages} isAnswering={isAnswering} onSend={send} onStop={stop} />
         ) : (
-          <UploadScreen phase={uploadPhase} fileName={uploadFileName} error={uploadError} onUpload={handleUpload} />
+          <UploadScreen progress={uploadProgress} fileName={uploadFileName} error={uploadError} onUpload={handleUpload} />
         )}
       </main>
     </div>

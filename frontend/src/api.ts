@@ -8,6 +8,10 @@ export type DocumentInfo = {
   documentType?: DocumentType;
   pages?: number;
   chunks?: number;
+  /** Pages that had no text layer and were read with OCR. */
+  ocrPages?: number;
+  /** "low" when OCR confidence suggests handwriting or a poor scan. */
+  ocrQuality?: "good" | "low" | null;
 };
 
 export type Source = {
@@ -21,12 +25,30 @@ export type HistoryMessage = { role: "user" | "assistant"; content: string };
 
 export type UploadPhase = "uploading" | "processing";
 
+export type IngestStage = "reading" | "recognizing" | "embedding" | "saving";
+
+export type UploadProgress = {
+  phase: UploadPhase;
+  /** What the server is doing while processing, and the overall percentage. */
+  stage?: IngestStage;
+  percent?: number;
+  /** Set while scanned pages are being read with OCR. */
+  ocrPagesDone?: number;
+  ocrPagesTotal?: number;
+};
+
 type StatusResponse = {
   status: "pending" | "processing" | "ready" | "failed";
   reason?: string;
   document_type?: DocumentType;
   pages?: number;
   chunks?: number;
+  ocr_pages?: number;
+  ocr_quality?: "good" | "low" | null;
+  stage?: IngestStage;
+  progress?: number;
+  ocr_pages_done?: number;
+  ocr_pages_total?: number;
 };
 
 /** An error whose message is safe and useful to show to the user. */
@@ -48,8 +70,8 @@ function wait(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-export async function uploadPdf(file: File, onPhase: (phase: UploadPhase) => void): Promise<DocumentInfo> {
-  onPhase("uploading");
+export async function uploadPdf(file: File, onProgress: (progress: UploadProgress) => void): Promise<DocumentInfo> {
+  onProgress({ phase: "uploading" });
   const formData = new FormData();
   formData.append("file", file);
 
@@ -59,7 +81,7 @@ export async function uploadPdf(file: File, onPhase: (phase: UploadPhase) => voi
   }
   const { document_id: id, filename } = await response.json();
 
-  onPhase("processing");
+  onProgress({ phase: "processing" });
   for (;;) {
     const statusResponse = await fetch(`${API_BASE_URL}/upload/${id}/status`);
     if (!statusResponse.ok) throw new ApiError("We lost track of that upload. Please try again.");
@@ -72,11 +94,20 @@ export async function uploadPdf(file: File, onPhase: (phase: UploadPhase) => voi
         documentType: status.document_type,
         pages: status.pages,
         chunks: status.chunks,
+        ocrPages: status.ocr_pages,
+        ocrQuality: status.ocr_quality,
       };
     }
     if (status.status === "failed") {
       throw new ApiError(status.reason ?? "We couldn't process this PDF. Please try another file.");
     }
+    onProgress({
+      phase: "processing",
+      stage: status.stage,
+      percent: status.progress,
+      ocrPagesDone: status.ocr_pages_done,
+      ocrPagesTotal: status.ocr_pages_total,
+    });
     await wait(POLL_INTERVAL_MS);
   }
 }

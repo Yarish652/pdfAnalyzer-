@@ -1,8 +1,8 @@
 import { type ChangeEvent, type DragEvent, useState } from "react";
-import type { UploadPhase } from "../api";
+import type { UploadPhase, UploadProgress } from "../api";
 
 type Props = {
-  phase: UploadPhase | null;
+  progress: UploadProgress | null;
   fileName: string | null;
   error: string;
   onUpload: (file: File) => void;
@@ -14,7 +14,8 @@ const STEPS: { phase: UploadPhase | "ready"; label: string }[] = [
   { phase: "ready", label: "Ready to chat" },
 ];
 
-export function UploadScreen({ phase, fileName, error, onUpload }: Props) {
+export function UploadScreen({ progress, fileName, error, onUpload }: Props) {
+  const phase = progress?.phase ?? null;
   const [isDragging, setIsDragging] = useState(false);
   const [localError, setLocalError] = useState("");
   const isBusy = phase !== null;
@@ -73,7 +74,7 @@ export function UploadScreen({ phase, fileName, error, onUpload }: Props) {
         {isBusy ? (
           <span className="drop-copy">
             <strong>{fileName}</strong>
-            <span>{phase === "uploading" ? "Uploading…" : "Reading and indexing. Long documents take a minute."}</span>
+            <span>{statusText(progress)}</span>
           </span>
         ) : (
           <span className="drop-copy">
@@ -98,6 +99,22 @@ export function UploadScreen({ phase, fileName, error, onUpload }: Props) {
         </ol>
       )}
 
+      {progress?.phase === "processing" && progress.percent !== undefined && (
+        <div className="progress">
+          <div
+            className="progress-bar"
+            role="progressbar"
+            aria-label="Processing progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={progress.percent}
+          >
+            <span style={{ width: `${progress.percent}%` }} />
+          </div>
+          <span className="progress-value">{progress.percent}%</span>
+        </div>
+      )}
+
       {shownError && (
         <p className="upload-error" role="alert">
           {shownError}
@@ -105,4 +122,19 @@ export function UploadScreen({ phase, fileName, error, onUpload }: Props) {
       )}
     </section>
   );
+}
+
+function statusText(progress: UploadProgress | null): string {
+  if (!progress) return "";
+  if (progress.phase === "uploading") return "Uploading…";
+  switch (progress.stage) {
+    case "recognizing":
+      return `This PDF is scanned. Reading page ${progress.ocrPagesDone ?? 0} of ${progress.ocrPagesTotal ?? "?"} with text recognition…`;
+    case "embedding":
+      return "Indexing the document for search…";
+    case "saving":
+      return "Saving…";
+    default:
+      return "Reading the document…";
+  }
 }

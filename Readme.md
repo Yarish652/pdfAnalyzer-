@@ -10,8 +10,9 @@ cross-encoder reranking.
 When a PDF is uploaded, the backend:
 
 1. Extracts text blocks and their lines per page with PyMuPDF
-   (`pdf_reader.py`). Image-only (scanned) PDFs have no text layer and are
-   rejected with status `failed`.
+   (`pdf_reader.py`). Pages with no text layer (scans, image-only slides)
+   are read with OCR (`ocr.py`); pages that have a text layer are never
+   OCRed. See [Scanned PDFs (OCR)](#scanned-pdfs-ocr).
 2. Classifies the document as `resume`, `slides`, or `prose`
    (`document_classifier.py`) from layout signals: page count, contact
    details, resume section headings, page orientation, and words per page.
@@ -22,8 +23,29 @@ When a PDF is uploaded, the backend:
    - **prose** (books, papers, reports, notes): sentence-packed chunks of up
      to about 150 words that never cross a numbered section heading, with
      running headers, page numbers, and figure-label noise removed.
-4. Embeds the chunks with MPNet and stores them in Chroma with their page,
-   section, and document type.
+4. Embeds the chunks with MPNet (`all-mpnet-base-v2`, configurable with
+   `EMBEDDING_MODEL`) and stores them in Chroma with their page, section, and
+   document type.
+
+### Ingestion speed
+
+Embedding is the slowest step for text PDFs on CPU. Measured on the 49-page
+book chapter (144 chunks):
+
+| Embedding setup | Time | Book Hit@1 / Hit@3 / MRR |
+|---|---|---|
+| MPNet, PyTorch default threads | ~56 s | 0.87 / 0.96 / 0.91 |
+| **MPNet, all CPU threads (default)** | **~40-46 s** | **0.87 / 0.96 / 0.91** |
+| MiniLM-L6 (`EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`) | ~7 s | 0.83 / 0.91 / 0.88 |
+
+MPNet stays the default because the faster MiniLM-L6 retrieves measurably
+worse on long documents (both score 1.00 on the resume). Also tried and
+rejected: `granite-embedding-small-english-r2` (about 2x slower than MPNet on
+this CPU) and int8 ONNX builds of MPNet (vectors differ too much from the
+original model).
+
+Each embedding model has its own Chroma collection, so switching
+`EMBEDDING_MODEL` requires uploading documents again.
 
 ## Retrieval pipeline
 
@@ -46,9 +68,12 @@ For each question, the backend:
 ## API
 
 - `POST /upload` accepts a PDF and returns `202` with a `document_id`.
-- `GET /upload/{document_id}/status` returns `pending`, `processing`,
-  `ready` (with `document_type`, `pages`, and `chunks`), or `failed` (with a
-  user-facing `reason`, for example for scanned PDFs).
+- `GET /upload/{document_id}/status` returns `pending`, `processing` (with
+  `stage` — `reading`, `recognizing`, `embedding`, or `saving` — and an
+  overall `progress` percentage, plus `ocr_pages_done` and `ocr_pages_total`
+  while scanned pages are read), `ready` (with `document_type`, `pages`,
+  `chunks`, `ocr_pages`, and `ocr_quality`), or `failed` (with a
+  user-facing `reason`).
 - `POST /ask/stream` streams the answer as server-sent events: `sources`
   first (as soon as retrieval finishes), then `token` deltas, then `done`
   with the full answer, or `error`. The frontend uses this endpoint.
@@ -84,9 +109,13 @@ immediately, since retrying cannot succeed until the quota resets.
 Create and activate a Python virtual environment, then install the backend packages:
 
 ```bash
-pip install fastapi "uvicorn[standard]" python-multipart pypdf pymupdf chromadb sentence-transformers onnxruntime openai python-dotenv nltk tenacity
+pip install fastapi "uvicorn[standard]" python-multipart pypdf pymupdf chromadb sentence-transformers onnxruntime rapidocr openai python-dotenv nltk tenacity
 python -m nltk.downloader punkt punkt_tab
 ```
+
+`rapidocr` is only needed for scanned PDFs. Without it, text PDFs work as
+before and scanned PDFs are rejected with an explanation. Its models download
+automatically the first time a scanned page is read.
 
 PDF extraction uses PyMuPDF, which is licensed under the AGPL. Check that this
 fits how you distribute the project.
@@ -101,6 +130,10 @@ OPENROUTER_MODEL=nvidia/nemotron-3.5-lightning:free
 # Optional upload limits: defaults to 20 MiB and 300 pages
 MAX_UPLOAD_SIZE_BYTES=20971520
 MAX_PDF_PAGES=300
+# Optional: set to false to skip OCR and reject scanned PDFs
+OCR_ENABLED=true
+# Optional: embedding model; changing it requires uploading documents again
+EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
 ```
 
 `MAX_UPLOAD_SIZE_BYTES` controls the maximum uploaded PDF size. `MAX_PDF_PAGES`
@@ -124,6 +157,39 @@ npm run dev
 ```
 
 The Vite development server proxies `/upload` and `/ask` (including `/ask/stream`) to the backend at `http://127.0.0.1:8000`.
+
+## Scanned PDFs (OCR)
+
+Pages without a text layer are rendered and read with
+[RapidOCR](https://github.com/RapidAI/RapidOCR) (PaddleOCR PP-OCRv6 models
+on ONNX Runtime): free, CPU only, no system install. The recognized lines are
+rebuilt into the same blocks and lines that PyMuPDF produces, so detection of
+resumes, slides, and prose and all chunking work unchanged:
+
+- Fragments on the same row are joined left to right, so table rows and
+  "Project title ... Feb '26 - Jun '26" lines stay together.
+- Two-column pages are read one column at a time.
+- Rows of diagram labels are kept apart from paragraphs so the chunker's noise
+  filter can drop them.
+
+Measured by rendering the benchmark PDFs to image-only scans and asking the
+same questions:
+
+| Document | Hit@1 | Hit@3 | MRR |
+|---|---|---|---|
+| Book chapter, original text PDF | 0.87 | 0.96 | 0.91 |
+| Book chapter, scanned + OCR | 0.78 | 0.91 | 0.86 |
+| Resume, original text PDF | 1.00 | 1.00 | 1.00 |
+| Resume, scanned + OCR | 1.00 | 1.00 | 1.00 |
+
+Printed scans and slides are read with about 97% word accuracy. Handwritten
+notes are read poorly; when the mean recognition confidence of a document is
+below 0.9 (printed pages measured 0.94-0.996, handwriting 0.80-0.85) the
+status reports `ocr_quality: "low"` and the chat shows a warning.
+
+OCR is the slowest part of ingestion on CPU: about 1.5-2 s per slide and
+4-7 s per dense book page on the development laptop. The upload screen shows
+page-by-page progress.
 
 ## Tests
 

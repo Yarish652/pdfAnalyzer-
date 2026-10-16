@@ -31,7 +31,7 @@ import chromadb
 from backend import keyword_retriever, vector_store
 from backend.chunker import chunk_document
 from backend.context_builder import expand_with_neighbors, format_context
-from backend.embedding import embed_texts
+from backend.embedding import embed_documents, embed_texts
 from backend.hybrid_retriever import reciprocal_rank_fusion
 from backend.keyword_retriever import retrieve_keyword_chunks
 from backend.pdf_reader import extract_document
@@ -93,7 +93,7 @@ def ingest(pdf_path: str, document_id: str, extract_fn=extract_document, chunk_f
     timings["chunk_s"] = time.perf_counter() - start
 
     start = time.perf_counter()
-    embeddings = embed_texts([chunk["text"] for chunk in chunks])
+    embeddings = embed_documents([chunk["text"] for chunk in chunks])
     timings["embed_s"] = time.perf_counter() - start
 
     start = time.perf_counter()

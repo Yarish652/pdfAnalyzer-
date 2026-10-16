@@ -12,12 +12,13 @@ from openai import OpenAIError
 from pydantic import BaseModel
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
-from config import MAX_PDF_PAGES, MAX_UPLOAD_SIZE_BYTES
+from config import MAX_PDF_PAGES, MAX_UPLOAD_SIZE_BYTES, OCR_ENABLED
 
 from pdf_reader import extract_document
+import ocr
 from chunker import chunk_document
 from document_classifier import classify_document
-from embedding import embed_texts
+from embedding import embed_documents, embed_texts
 from hybrid_retriever import reciprocal_rank_fusion
 from keyword_retriever import retrieve_keyword_chunks
 from reranker import rerank_chunks
@@ -61,7 +62,11 @@ upload_details: dict[str, dict] = {}
 
 NO_TEXT_REASON = (
     "This PDF has no selectable text. It is probably a scanned image, "
-    "which is not supported yet."
+    "and text recognition (OCR) is turned off or not installed."
+)
+NO_TEXT_AFTER_OCR_REASON = (
+    "We couldn't find any readable text in this PDF, even with text "
+    "recognition. The scan may be too blurry or contain only images."
 )
 GENERIC_FAILURE_REASON = "We couldn't process this PDF. Please try another file."
 
@@ -185,12 +190,50 @@ async def add_correlation_id(request, call_next):
     return response
 
 
+def ocr_quality(document) -> str | None:
+    """"low" when recognized text is unreliable (for example handwriting)."""
+    confidences = [page["ocr_confidence"] for page in document if page.get("ocr_confidence") is not None]
+    if not confidences:
+        return None
+    return "low" if sum(confidences) / len(confidences) < ocr.LOW_CONFIDENCE else "good"
+
+
+# Share of the progress bar for reading pages. OCR dominates ingestion time
+# when it runs; reading a text layer is nearly instant.
+TEXT_READ_SHARE = 10
+OCR_READ_SHARE = 60
+EMBEDDING_DONE = 95
+
+
+def report_progress(document_id: str, stage: str, percent: float, **extra) -> None:
+    upload_details[document_id] = {"stage": stage, "progress": int(percent), **extra}
+
+
 async def process_upload(document_id: str, file, correlation_id: str) -> None:
-    """Run the synchronous PDF ingestion pipeline outside the event loop."""
+    """Run the synchronous PDF ingestion pipeline outside the event loop.
+
+    Progress is published through upload_details as a stage ("reading",
+    "recognizing", "embedding", "saving") and an overall percentage.
+    """
     upload_jobs[document_id] = "processing"
+    report_progress(document_id, "reading", 0)
+
+    def report_ocr_progress(done: int, total: int) -> None:
+        report_progress(
+            document_id,
+            "recognizing",
+            OCR_READ_SHARE * done / total,
+            ocr_pages_done=done,
+            ocr_pages_total=total,
+        )
 
     try:
-        document = await run_in_threadpool(extract_document, file)
+        document = await run_in_threadpool(
+            extract_document,
+            file,
+            ocr=OCR_ENABLED,
+            on_progress=report_ocr_progress,
+        )
     except PdfReadError:
         logger.exception("Upload extraction failed request_id=%s", correlation_id)
         upload_jobs[document_id] = "failed"
@@ -204,7 +247,10 @@ async def process_upload(document_id: str, file, correlation_id: str) -> None:
         # Image-only (scanned) PDFs have no text layer; there is nothing to index.
         logger.warning("Upload has no extractable text request_id=%s", correlation_id)
         upload_jobs[document_id] = "failed"
-        upload_details[document_id] = {"reason": NO_TEXT_REASON}
+        ocr_was_used = OCR_ENABLED and ocr.is_available()
+        upload_details[document_id] = {
+            "reason": NO_TEXT_AFTER_OCR_REASON if ocr_was_used else NO_TEXT_REASON,
+        }
         return
 
     try:
@@ -234,13 +280,28 @@ async def process_upload(document_id: str, file, correlation_id: str) -> None:
         upload_jobs[document_id] = "failed"
         return
 
+    read_share = OCR_READ_SHARE if any(page.get("ocr") for page in document) else TEXT_READ_SHARE
+    report_progress(document_id, "embedding", read_share)
+
+    def report_embedding_progress(done: int, total: int) -> None:
+        report_progress(
+            document_id,
+            "embedding",
+            read_share + (EMBEDDING_DONE - read_share) * done / total,
+        )
+
     try:
-        embeddings = await run_in_threadpool(embed_texts, texts)
+        embeddings = await run_in_threadpool(
+            embed_documents,
+            texts,
+            on_progress=report_embedding_progress,
+        )
     except Exception:
         logger.exception("Upload embedding failed request_id=%s", correlation_id)
         upload_jobs[document_id] = "failed"
         return
 
+    report_progress(document_id, "saving", EMBEDDING_DONE)
     try:
         await run_in_threadpool(add_documents, chunks, embeddings)
     except ChromaError:
@@ -254,6 +315,8 @@ async def process_upload(document_id: str, file, correlation_id: str) -> None:
             "document_type": classification.document_type,
             "pages": max(page["page"] for page in document),
             "chunks": len(chunks),
+            "ocr_pages": sum(1 for page in document if page.get("ocr")),
+            "ocr_quality": ocr_quality(document),
         }
         upload_jobs[document_id] = "ready"
 
@@ -307,8 +370,9 @@ async def upload_status(document_id: str):
         raise HTTPException(status_code=404, detail="Upload not found.")
 
     details = upload_details.get(document_id, {})
-    if status == "failed" and "reason" not in details:
-        details = {**details, "reason": GENERIC_FAILURE_REASON}
+    if status == "failed":
+        # Progress from the step that failed is not useful to the client.
+        details = {"reason": details.get("reason", GENERIC_FAILURE_REASON)}
 
     return {"document_id": document_id, "status": status, **details}
 
