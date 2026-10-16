@@ -59,6 +59,12 @@ export function ChatScreen({ doc, messages, isAnswering, onSend, onStop }: Props
     <section className="chat" aria-label={`Conversation about ${doc.name}`}>
       <div className="chat-scroll" ref={scrollRef} onScroll={handleScroll}>
         <div className="chat-column">
+          {doc.ocrQuality === "low" && (
+            <p className="ocr-notice" role="note">
+              This document looks handwritten or hard to read, so some text may have been
+              misread. Check important details against the cited pages.
+            </p>
+          )}
           {messages.length === 0 ? (
             <div className="chat-empty">
               <h2>What would you like to know?</h2>

@@ -15,6 +15,7 @@ from chunker import (
 from context_builder import expand_with_neighbors, format_context
 from document_classifier import PROSE, RESUME, SLIDES, classify_document, is_resume_section
 from pdf_reader import _join_hyphenated, extract_document
+import ocr
 
 
 def page(number, blocks, lines=None, landscape=False):
@@ -274,6 +275,104 @@ class ContextBuilderTests(unittest.TestCase):
         )
 
 
+def box(text, x0, y0, x1, height=20):
+    return {"text": text, "x0": x0, "x1": x1, "y0": y0, "y1": y0 + height}
+
+
+class CollectionNameTests(unittest.TestCase):
+    def test_each_embedding_model_gets_its_own_collection(self):
+        import vector_store
+
+        self.assertEqual(vector_store.collection_name("sentence-transformers/all-mpnet-base-v2"), "pdf_documents")
+        self.assertEqual(
+            vector_store.collection_name("sentence-transformers/all-MiniLM-L6-v2"),
+            "pdf_documents__sentence_transformers_all_MiniLM_L6_v2",
+        )
+
+
+class EmbedDocumentsTests(unittest.TestCase):
+    def test_vectors_keep_input_order_and_progress_is_reported(self):
+        import embedding
+
+        class FakeModel:
+            def __init__(self):
+                self.batches = []
+
+            def encode(self, texts):
+                self.batches.append(list(texts))
+                return [[float(len(text))] for text in texts]
+
+            def get_sentence_embedding_dimension(self):
+                return 1
+
+        original_model, original_batch = embedding.model, embedding.DOCUMENT_BATCH_SIZE
+        embedding.model, embedding.DOCUMENT_BATCH_SIZE = FakeModel(), 2
+        try:
+            progress = []
+            texts = ["ccc", "a", "bbbbb", "dd"]
+
+            vectors = embedding.embed_documents(texts, on_progress=lambda done, total: progress.append((done, total)))
+
+            self.assertEqual(vectors.reshape(-1).tolist(), [3.0, 1.0, 5.0, 2.0])
+            self.assertEqual(embedding.model.batches, [["a", "dd"], ["ccc", "bbbbb"]])
+            self.assertEqual(progress, [(2, 4), (4, 4)])
+            self.assertEqual(embedding.embed_documents([]).shape, (0, 1))
+        finally:
+            embedding.model, embedding.DOCUMENT_BATCH_SIZE = original_model, original_batch
+
+
+class OcrLayoutTests(unittest.TestCase):
+    WIDTH = 1000
+
+    def test_title_and_right_aligned_date_stay_on_one_line(self):
+        lines = [
+            box("PROJECTS", 50, 100, 200),
+            box("Speakzy - Language Platform", 50, 140, 400),
+            box("Nov '25 - Mar '26", 800, 141, 950),
+            box("• Built a full-stack platform.", 60, 165, 900),
+        ]
+
+        blocks = ocr.group_into_blocks(lines, self.WIDTH)
+
+        self.assertIn("Speakzy - Language Platform Nov '25 - Mar '26", "\n".join(blocks))
+
+    def test_table_is_read_row_by_row(self):
+        lines = []
+        for row, cells in enumerate([
+            ("Year", "Degree", "Institute", "CGPA"),
+            ("2027", "B.Tech", "Jamia Millia Islamia", "7/10"),
+            ("2022", "Class XII", "STS School", "85%"),
+        ]):
+            for column, cell in enumerate(cells):
+                lines.append(box(cell, 50 + column * 230, 100 + row * 25, 50 + column * 230 + 150))
+
+        text = "\n".join(ocr.group_into_blocks(lines, self.WIDTH))
+
+        self.assertIn("2027 B.Tech Jamia Millia Islamia 7/10", text)
+        self.assertIn("2022 Class XII STS School 85%", text)
+
+    def test_two_column_page_reads_left_column_first(self):
+        lines = [box(f"left line {index}", 50, 100 + index * 25, 470) for index in range(6)]
+        lines += [box(f"right line {index}", 530, 100 + index * 25, 950) for index in range(6)]
+
+        blocks = ocr.group_into_blocks(lines, self.WIDTH)
+
+        self.assertTrue(ocr.is_two_column(lines, self.WIDTH))
+        self.assertEqual(blocks, [
+            "\n".join(f"left line {index}" for index in range(6)),
+            "\n".join(f"right line {index}" for index in range(6)),
+        ])
+
+    def test_a_few_right_aligned_dates_are_not_columns(self):
+        lines = [box(f"Full width content line {index}", 50, 100 + index * 25, 950) for index in range(8)]
+        lines += [box("Jun '26", 850, 300, 950), box("Feb '26", 850, 400, 950)]
+
+        self.assertFalse(ocr.is_two_column(lines, self.WIDTH))
+
+    def test_no_lines_gives_no_blocks(self):
+        self.assertEqual(ocr.group_into_blocks([], self.WIDTH), [])
+
+
 class PdfReaderTests(unittest.TestCase):
     def test_line_break_hyphen_joined_only_for_known_words(self):
         vocabulary = {"successful", "grapheme", "phoneme"}
@@ -296,11 +395,74 @@ class PdfReaderTests(unittest.TestCase):
         self.assertIn("Contents … 23", all_text)
         self.assertTrue(all(isinstance(lines, list) for lines in document[0]["lines"]))
 
-    def test_image_only_pdf_yields_no_pages(self):
+    def test_image_only_pdf_yields_no_pages_without_ocr(self):
         pdf = pymupdf.open()
         pdf.new_page()
 
-        self.assertEqual(extract_document(BytesIO(pdf.tobytes())), [])
+        self.assertEqual(extract_document(BytesIO(pdf.tobytes()), ocr=False), [])
+
+
+class OcrExtractionTests(unittest.TestCase):
+    """The OCR engine is replaced by a fake so these tests need no models."""
+
+    def setUp(self):
+        self.original = (ocr.is_available, ocr.ocr_page)
+        self.ocr_calls = []
+
+        def fake_ocr_page(page):
+            self.ocr_calls.append(page.number)
+            return ["Scanned paragraph about recurrent networks."], 0.95
+
+        ocr.is_available = lambda: True
+        ocr.ocr_page = fake_ocr_page
+
+        pdf = pymupdf.open()
+        pdf.new_page().insert_text((72, 72), "A page with a real text layer.")
+        pdf.new_page()  # no text layer, like a scanned page
+        self.stream = BytesIO(pdf.tobytes())
+
+    def tearDown(self):
+        ocr.is_available, ocr.ocr_page = self.original
+
+    def test_only_pages_without_text_are_ocred(self):
+        progress = []
+
+        document = extract_document(self.stream, on_progress=lambda done, total: progress.append((done, total)))
+
+        self.assertEqual(self.ocr_calls, [1])
+        self.assertEqual(progress, [(1, 1)])
+        self.assertNotIn("ocr", document[0])
+        self.assertNotIn("ocr_confidence", document[0])
+        self.assertEqual(document[1]["blocks"], ["Scanned paragraph about recurrent networks."])
+        self.assertTrue(document[1]["ocr"])
+        self.assertEqual(document[1]["ocr_confidence"], 0.95)
+
+    def test_ocr_can_be_turned_off(self):
+        document = extract_document(self.stream, ocr=False)
+
+        self.assertEqual(self.ocr_calls, [])
+        self.assertEqual([page["page"] for page in document], [1])
+
+    def test_unavailable_engine_skips_ocr(self):
+        ocr.is_available = lambda: False
+
+        document = extract_document(self.stream)
+
+        self.assertEqual(self.ocr_calls, [])
+        self.assertEqual(len(document), 1)
+
+    def test_low_confidence_marks_document_quality(self):
+        import api
+
+        self.assertIsNone(api.ocr_quality([{"page": 1, "blocks": ["text"]}]))
+        self.assertEqual(api.ocr_quality([{"page": 1, "ocr": True, "ocr_confidence": 0.98}]), "good")
+        self.assertEqual(
+            api.ocr_quality([
+                {"page": 1, "ocr": True, "ocr_confidence": 0.95},
+                {"page": 2, "ocr": True, "ocr_confidence": 0.78},
+            ]),
+            "low",
+        )
 
 
 if __name__ == "__main__":

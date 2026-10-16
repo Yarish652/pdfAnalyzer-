@@ -1,13 +1,35 @@
 from pathlib import Path
 
+import hashlib
+import re
+
 import chromadb
+
+try:
+    from backend.config import DEFAULT_EMBEDDING_MODEL, EMBEDDING_MODEL
+except ModuleNotFoundError:
+    from config import DEFAULT_EMBEDDING_MODEL, EMBEDDING_MODEL
 
 
 CHROMA_DB_PATH = Path(__file__).resolve().parent / "chroma_db"
 client = chromadb.PersistentClient(path=str(CHROMA_DB_PATH))
 
+
+def collection_name(model_name: str) -> str:
+    """One collection per embedding model: vectors from different models are
+    not comparable, and their dimensions may differ."""
+    if model_name == DEFAULT_EMBEDDING_MODEL:
+        return "pdf_documents"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", model_name).strip("_")
+    if len(slug) > 40:
+        # Truncated names could collide; a hash of the full name keeps them apart.
+        digest = hashlib.sha1(model_name.encode("utf-8")).hexdigest()[:8]
+        slug = slug[:31].rstrip("_") + "_" + digest
+    return "pdf_documents__" + slug
+
+
 collection = client.get_or_create_collection(
-    name="pdf_documents"
+    name=collection_name(EMBEDDING_MODEL)
 )
 
 

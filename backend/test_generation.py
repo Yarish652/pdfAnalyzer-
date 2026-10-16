@@ -403,18 +403,20 @@ class DocumentIsolationTests(unittest.TestCase):
         self.original_extract = api.extract_document
         self.original_chunk = api.chunk_document
         self.original_embed = api.embed_texts
+        self.original_embed_documents = api.embed_documents
         self.original_add = api.add_documents
         self.original_validate_pdf = api.validate_pdf
         self.original_collection = __import__("vector_store").collection
         self.collection = _Collection()
         __import__("vector_store").collection = self.collection
 
-        api.extract_document = lambda _file: [{"page": 1, "blocks": ["text"]}]
+        api.extract_document = lambda _file, **_kwargs: [{"page": 1, "blocks": ["text"]}]
         api.chunk_document = lambda _document, _document_type=None: [{
             "text": "text",
             "metadata": {"page": 1, "chunk_index": 0},
         }]
         api.embed_texts = lambda _texts: _Embeddings()
+        api.embed_documents = lambda _texts, on_progress=None: _Embeddings()
         api.add_documents = __import__("vector_store").add_documents
         api.validate_pdf = lambda _file, _content_type: None
 
@@ -422,6 +424,7 @@ class DocumentIsolationTests(unittest.TestCase):
         api.extract_document = self.original_extract
         api.chunk_document = self.original_chunk
         api.embed_texts = self.original_embed
+        api.embed_documents = self.original_embed_documents
         api.add_documents = self.original_add
         api.validate_pdf = self.original_validate_pdf
         __import__("vector_store").collection = self.original_collection
@@ -465,7 +468,7 @@ class DocumentIsolationTests(unittest.TestCase):
 
 
     def test_image_only_pdf_marks_upload_failed_without_storing(self):
-        api.extract_document = lambda _file: []
+        api.extract_document = lambda _file, **_kwargs: []
 
         async def upload():
             background_tasks = BackgroundTasks()
@@ -493,14 +496,98 @@ class DocumentIsolationTests(unittest.TestCase):
 
         ready = asyncio.run(upload(b"text"))
         self.assertEqual(
-            {key: ready[key] for key in ("status", "document_type", "pages", "chunks")},
-            {"status": "ready", "document_type": "prose", "pages": 1, "chunks": 1},
+            {key: ready[key] for key in ("status", "document_type", "pages", "chunks", "ocr_pages")},
+            {"status": "ready", "document_type": "prose", "pages": 1, "chunks": 1, "ocr_pages": 0},
         )
 
-        api.extract_document = lambda _file: []
-        failed = asyncio.run(upload(b"scan"))
-        self.assertEqual(failed["status"], "failed")
-        self.assertIn("scanned image", failed["reason"])
+        api.extract_document = lambda _file, **_kwargs: []
+        original_enabled, original_available = api.OCR_ENABLED, api.ocr.is_available
+        try:
+            api.OCR_ENABLED = True
+            api.ocr.is_available = lambda: True
+            failed = asyncio.run(upload(b"scan"))
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("even with text recognition", failed["reason"])
+
+            api.OCR_ENABLED = False
+            failed = asyncio.run(upload(b"scan"))
+            self.assertIn("scanned image", failed["reason"])
+        finally:
+            api.OCR_ENABLED, api.ocr.is_available = original_enabled, original_available
+
+    def test_progress_percentage_moves_through_stages(self):
+        snapshots = []
+        document_ids = []
+
+        def record():
+            details = api.upload_details[document_ids[0]]
+            snapshots.append((details["stage"], details["progress"]))
+
+        def embed(_texts, on_progress=None):
+            record()
+            for done in (1, 2):
+                on_progress(done, 2)
+                record()
+            return _Embeddings()
+
+        def add(chunks, embeddings):
+            record()
+
+        api.embed_documents = embed
+        api.add_documents = add
+
+        async def upload():
+            background_tasks = BackgroundTasks()
+            response = await api.upload_pdf(
+                background_tasks,
+                UploadFile(filename="doc.pdf", file=BytesIO(b"text")),
+            )
+            document_ids.append(json.loads(response.body)["document_id"])
+            await background_tasks()
+            return await api.upload_status(document_ids[0])
+
+        status = asyncio.run(upload())
+
+        self.assertEqual(snapshots, [
+            ("embedding", api.TEXT_READ_SHARE),
+            ("embedding", 52),
+            ("embedding", api.EMBEDDING_DONE),
+            ("saving", api.EMBEDDING_DONE),
+        ])
+        self.assertEqual(status["status"], "ready")
+        self.assertNotIn("progress", status)
+
+    def test_ocr_progress_is_reported_while_processing(self):
+        snapshots = []
+
+        def extract_with_ocr(_file, ocr, on_progress):
+            for done in (1, 2):
+                on_progress(done, 2)
+                snapshots.append(dict(api.upload_details[document_ids[0]]))
+            return [{"page": 1, "blocks": ["scanned text"], "ocr": True}]
+
+        api.extract_document = extract_with_ocr
+        document_ids = []
+
+        async def upload():
+            background_tasks = BackgroundTasks()
+            response = await api.upload_pdf(
+                background_tasks,
+                UploadFile(filename="scan.pdf", file=BytesIO(b"scan")),
+            )
+            document_ids.append(json.loads(response.body)["document_id"])
+            await background_tasks()
+            return await api.upload_status(document_ids[0])
+
+        status = asyncio.run(upload())
+
+        self.assertEqual(snapshots, [
+            {"stage": "recognizing", "progress": 30, "ocr_pages_done": 1, "ocr_pages_total": 2},
+            {"stage": "recognizing", "progress": 60, "ocr_pages_done": 2, "ocr_pages_total": 2},
+        ])
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["ocr_pages"], 1)
+        self.assertNotIn("ocr_pages_done", status)
 
 
 class EventLoopConcurrencyTests(unittest.TestCase):
